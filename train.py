@@ -81,61 +81,68 @@ class RenderCallback(BaseCallback):
             self.logger.record("rollout/history_mean_reward", sum(recent_scores) / len(recent_scores))
 
         # --- 3. VISUALIZATION (Unsafe on Colab/Headless) ---
+        # Optimization: Redraw graph every 1000 steps, but process events (waitKey) more often
         try:
-            # Update Graph window
-            if not self.windows_initialized:
-                 # Check if we have a display (primitive check)
-                 if os.environ.get('DISPLAY') is None and os.name != 'nt':
-                     return True # Skip render on headless Linux without X11
-                 
-                 cv2.namedWindow("Score History", cv2.WINDOW_AUTOSIZE)
-                 cv2.moveWindow("Score History", 100, 100)
-                 self.windows_initialized = True
+            # 1. Frequent Event Processing (Keep Window Responsive)
+            if self.windows_initialized and self.num_timesteps % 100 == 0:
+                 cv2.waitKey(1)
 
-            # Create black canvas
-            g_w, g_h = 600, 300 
-            graph_frame = np.zeros((g_h, g_w, 3), dtype=np.uint8)
+            # 2. Infrequent Heavy Rendering (Save FPS)
+            if self.num_timesteps % 1000 == 0:
+                # Update Graph window
+                if not self.windows_initialized:
+                     # Check if we have a display (primitive check)
+                     if os.environ.get('DISPLAY') is None and os.name != 'nt':
+                         return True # Skip render on headless Linux without X11
+                     
+                     cv2.namedWindow("Score History", cv2.WINDOW_AUTOSIZE)
+                     cv2.moveWindow("Score History", 100, 100)
+                     self.windows_initialized = True
 
-            if len(self.score_history) > 1:
-                scores = list(self.score_history)
-                # Auto-scale
-                min_s, max_s = min(scores), max(scores)
-                if max_s == min_s: max_s += 1 
-                
-                total_points = len(scores)
-                # Downsample for drawing
-                draw_step = max(1, total_points // 600)
-                display_scores = scores[::draw_step]
-                total_display = len(display_scores)
+                # Create black canvas
+                g_w, g_h = 600, 300 
+                graph_frame = np.zeros((g_h, g_w, 3), dtype=np.uint8)
 
-                for i in range(1, total_display):
-                    p1 = display_scores[i-1]
-                    p2 = display_scores[i]
+                if len(self.score_history) > 1:
+                    scores = list(self.score_history)
+                    # Auto-scale
+                    min_s, max_s = min(scores), max(scores)
+                    if max_s == min_s: max_s += 1 
                     
-                    x1 = int((i-1) * (g_w / (total_display - 1)))
-                    x2 = int(i * (g_w / (total_display - 1)))
-                    
-                    y1 = int((g_h - 20) - ((p1 - min_s) / (max_s - min_s)) * (g_h - 40))
-                    y2 = int((g_h - 20) - ((p2 - min_s) / (max_s - min_s)) * (g_h - 40))
-                    
-                    cv2.line(graph_frame, (x1, y1), (x2, y2), (0, 255, 255), 1)
+                    total_points = len(scores)
+                    # Downsample for drawing
+                    draw_step = max(1, total_points // 600)
+                    display_scores = scores[::draw_step]
+                    total_display = len(display_scores)
 
-                # Stats Text
-                avg_score = sum(scores) / len(scores)
-                cv2.putText(graph_frame, f"Max: {max_s:.1f}", (10, 30), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(graph_frame, f"Avg: {avg_score:.1f}", (10, 60), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.putText(graph_frame, f"Last: {scores[-1]:.1f}", (10, 90), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-                cv2.putText(graph_frame, f"Games: {total_points}", (10, 120), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-            else:
-                 cv2.putText(graph_frame, "Waiting for games...", (50, 150), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 1)
+                    for i in range(1, total_display):
+                        p1 = display_scores[i-1]
+                        p2 = display_scores[i]
+                        
+                        x1 = int((i-1) * (g_w / (total_display - 1)))
+                        x2 = int(i * (g_w / (total_display - 1)))
+                        
+                        y1 = int((g_h - 20) - ((p1 - min_s) / (max_s - min_s)) * (g_h - 40))
+                        y2 = int((g_h - 20) - ((p2 - min_s) / (max_s - min_s)) * (g_h - 40))
+                        
+                        cv2.line(graph_frame, (x1, y1), (x2, y2), (0, 255, 255), 1)
 
-            cv2.imshow("Score History", graph_frame)
-            cv2.waitKey(1)
+                    # Stats Text
+                    avg_score = sum(scores) / len(scores)
+                    cv2.putText(graph_frame, f"Max: {max_s:.1f}", (10, 30), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                    cv2.putText(graph_frame, f"Avg: {avg_score:.1f}", (10, 60), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                    cv2.putText(graph_frame, f"Last: {scores[-1]:.1f}", (10, 90), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+                    cv2.putText(graph_frame, f"Games: {total_points}", (10, 120), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                else:
+                     cv2.putText(graph_frame, "Waiting for games...", (50, 150), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 1)
+
+                cv2.imshow("Score History", graph_frame)
+                cv2.waitKey(1)
             
         except Exception:
             pass 

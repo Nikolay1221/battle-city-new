@@ -6,8 +6,7 @@
 # Number of parallel environments. 
 # On Colab (2 cores), keep this around 8-16. 
 # On powerful PC (24 cores), go for 48-64.
-import multiprocessing
-NUM_CPU = multiprocessing.cpu_count()
+NUM_CPU = 48 
 
 # --- TRAINING DURATION ---
 # Total number of frames/steps to train for.
@@ -24,9 +23,9 @@ LOG_DIR = "logs"
 # --- PPO HYPERPARAMETERS ---
 # Advanced users only.
 LEARNING_RATE = 0.00001  # Slow & Careful
-N_STEPS       = 512      # Steps per update
-BATCH_SIZE    = 256      # Batch size
-ENT_COEF      = 0.1     
+N_STEPS       = 2048     # Increased for higher FPS (less frequent updates)
+BATCH_SIZE    = 512      # Increased Batch size
+ENT_COEF      = 0.1     # Entropy: Lowered to 0.05 to stabilize mastery.
 GAMMA         = 0.99     # Discount factor
 
 # --- SAFETY ---

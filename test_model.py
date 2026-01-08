@@ -64,7 +64,7 @@ def main():
             # Render is automatic in 'human' mode for nes-py
             # But we limit FPS to 60 to make it watchable
             env.render()
-            time.sleep(1/60.0) 
+            time.sleep(1/1000.0) # 1000 FPS Limit (Very Fast) 
             
             if terminated or truncated:
                 print(f"🏁 Game Over. Score: {info.get('score', 0)}")
