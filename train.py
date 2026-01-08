@@ -14,6 +14,12 @@ import torch as th # Added for Architecture Config
 
 import config # Load Configuration
 
+import warnings
+# Filter specific Gym warnings that spam the console
+warnings.filterwarnings("ignore", category=UserWarning, module="gym")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
 class ConsoleLoggerCallback(BaseCallback):
     def __init__(self, verbose=0):
         super(ConsoleLoggerCallback, self).__init__(verbose)
