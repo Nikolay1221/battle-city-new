@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Models & Logs (Heavy files)
+models/
+logs/
+*.zip
+*.pkl
+training_log.txt
+
+# Environment specific
+.env
+venv/
+env/
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
