@@ -2,6 +2,6 @@ gymnasium
 stable-baselines3[extra]
 nes-py
 opencv-python
-numpy
+numpy<2
 torch
 shimmy>=0.2.1
