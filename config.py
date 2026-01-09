@@ -13,8 +13,9 @@ TOTAL_TIMESTEPS = 5_000_000  # Total frames to train for.
 CHECKPOINT_FREQ = 10_000     # Save model every N steps.
 
 # --- HYPERPARAMETERS ---
-LEARNING_RATE = 0.00001 # 1e-5: Very slow and stable. Good for preventing collapse.
-ENTROPY_COEF = 0.2      # 0.2: High curiosity. Forces agent to try new things.
+LEARNING_RATE = 0.0003  # 3e-4: Standard stable PPO rate.
+ENTROPY_COEF = 0.05     # 0.05: Balanced exploration. Tries new things but doesn't ignore rewards.
+CLIP_RANGE = 0.2        # 0.2: Standard PPO clipping. Allows healthy updates.
 BATCH_SIZE = 256
 N_STEPS = 512           # Steps per update per env.
 
