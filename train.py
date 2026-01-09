@@ -128,11 +128,19 @@ class RenderCallback(BaseCallback):
             
             # One-time Window Setup
             if not self.windows_initialized:
-                 cv2.namedWindow("Battle City AI Training", cv2.WINDOW_AUTOSIZE)
-                 cv2.namedWindow("Score History Graph", cv2.WINDOW_AUTOSIZE)
-                 cv2.moveWindow("Battle City AI Training", 50, 50)
-                 cv2.moveWindow("Score History Graph", 800, 50)
-                 self.windows_initialized = True
+                try:
+                     cv2.namedWindow("Battle City AI Training", cv2.WINDOW_AUTOSIZE)
+                     cv2.namedWindow("Score History Graph", cv2.WINDOW_AUTOSIZE)
+                     cv2.moveWindow("Battle City AI Training", 50, 50)
+                     cv2.moveWindow("Score History Graph", 800, 50)
+                     self.windows_initialized = True
+                except Exception as e:
+                    print(f"\n[WARNING] Could not open display: {e}. Switching to HEADLESS MODE (Console only).")
+                    self.windows_initialized = "HEADLESS"
+
+            if self.windows_initialized == "HEADLESS":
+                return True # Skip rendering
+                
             # render() logic handled via INFO to save bandwidth
             # We only render the first environment's view
             try:
