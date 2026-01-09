@@ -7,18 +7,18 @@ import pickle         # Added for Graph Persistence
 from collections import deque # Added for Score History
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
-from stable_baselines3.common.monitor import Monitor # Keep just in case
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.env_util import make_vec_env # Needed for dynamic kwargs
 from battle_city_env import BattleCityEnv
 import torch as th # Added for Architecture Config
 
-import config # Load Configuration
+import torch as th # Added for Architecture Config
+import config # <--- IMPORT CONFIG
 
-import warnings
-# Filter specific Gym warnings that spam the console
-warnings.filterwarnings("ignore", category=UserWarning, module="gym")
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
+# Network Architecture calculation (Dependent on Config)
+# 2048 bytes * STACK_SIZE
+first_layer_size = 1024 * config.STACK_SIZE 
+if first_layer_size < 512: first_layer_size = 512
 
 class ConsoleLoggerCallback(BaseCallback):
     def __init__(self, verbose=0):
@@ -55,12 +55,13 @@ class RenderCallback(BaseCallback):
             self.score_history = deque() # Unlimited
         
     def _on_step(self) -> bool:
-        # --- 1. DATA COLLECTION (Safe) ---
         try:
-            # Detect End of Episode
+            # ... (Existing logic for collecting scores) ...
+            # Detect End of Episode to Record Score
             dones = self.locals.get('dones', [False])
             infos = self.locals.get('infos', [{}])
             
+            # Check ALL environments for finished games
             any_finished = False
             for i, done in enumerate(dones):
                 if done:
@@ -69,90 +70,106 @@ class RenderCallback(BaseCallback):
                     any_finished = True
             
             if any_finished:
-                # Save History
+                # Save History (If any game finished)
                 try:
                     with open(self.history_path, 'wb') as f:
                         pickle.dump(self.score_history, f)
-                except:
-                    pass
-        except Exception as e:
-            print(f"[Stats Error] {e}")
+                except Exception as e:
+                    print(f"[Graph] Save failed: {e}")
 
-        # --- 2. LOGGING TO CONSOLE (Safe) ---
-        # Record custom metrics to the main table
-        if len(self.score_history) > 0:
-            self.logger.record("time/total_games", len(self.score_history))
-            # Calculate mean of last 100 games for the log
-            recent_scores = list(self.score_history)[-100:]
-            self.logger.record("rollout/history_mean_reward", sum(recent_scores) / len(recent_scores))
-
-        # --- 3. VISUALIZATION (Unsafe on Colab/Headless) ---
-        # Optimization: Redraw graph every 1000 steps, but process events (waitKey) more often
-        try:
-            # 1. Frequent Event Processing (Keep Window Responsive)
-            if self.windows_initialized and self.num_timesteps % 100 == 0:
-                 cv2.waitKey(1)
-
-            # 2. Infrequent Heavy Rendering (Save FPS)
-            if self.num_timesteps % 1000 == 0:
-                # Update Graph window
-                if not self.windows_initialized:
-                     # Check if we have a display (primitive check)
-                     if os.environ.get('DISPLAY') is None and os.name != 'nt':
-                         return True # Skip render on headless Linux without X11
-                     
-                     cv2.namedWindow("Score History", cv2.WINDOW_AUTOSIZE)
-                     cv2.moveWindow("Score History", 100, 100)
-                     self.windows_initialized = True
-
+            current_obs = self.locals.get('new_obs')
+            
+            # --- SCORE GRAPH (SEPARATE WINDOW) ---
+            # Update Graph window every step (it's fast)
+            try:
                 # Create black canvas
-                g_w, g_h = 600, 300 
+                g_w, g_h = 800, 400 
                 graph_frame = np.zeros((g_h, g_w, 3), dtype=np.uint8)
 
                 if len(self.score_history) > 1:
                     scores = list(self.score_history)
-                    # Auto-scale
                     min_s, max_s = min(scores), max(scores)
                     if max_s == min_s: max_s += 1 
                     
+                    # Dynamic X-Scale
                     total_points = len(scores)
-                    # Downsample for drawing
-                    draw_step = max(1, total_points // 600)
-                    display_scores = scores[::draw_step]
-                    total_display = len(display_scores)
-
-                    for i in range(1, total_display):
-                        p1 = display_scores[i-1]
-                        p2 = display_scores[i]
+                    
+                    for i in range(1, total_points):
+                        p1_val = scores[i-1]
+                        p2_val = scores[i]
                         
-                        x1 = int((i-1) * (g_w / (total_display - 1)))
-                        x2 = int(i * (g_w / (total_display - 1)))
+                        # Scales
+                        x1 = int((i-1) * (g_w / (total_points - 1)))
+                        x2 = int(i * (g_w / (total_points - 1)))
                         
-                        y1 = int((g_h - 20) - ((p1 - min_s) / (max_s - min_s)) * (g_h - 40))
-                        y2 = int((g_h - 20) - ((p2 - min_s) / (max_s - min_s)) * (g_h - 40))
+                        # Invert Y (0 is top)
+                        y1 = int((g_h - 20) - ((p1_val - min_s) / (max_s - min_s)) * (g_h - 40))
+                        y2 = int((g_h - 20) - ((p2_val - min_s) / (max_s - min_s)) * (g_h - 40))
                         
                         cv2.line(graph_frame, (x1, y1), (x2, y2), (0, 255, 255), 1)
+                        
+                        # Only draw dots if not too crowded
+                        if total_points < 100:
+                            cv2.circle(graph_frame, (x2, y2), 3, (0, 0, 255), -1)
 
                     # Stats Text
-                    avg_score = sum(scores) / len(scores)
-                    cv2.putText(graph_frame, f"Max: {max_s:.1f}", (10, 30), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                    cv2.putText(graph_frame, f"Avg: {avg_score:.1f}", (10, 60), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                    cv2.putText(graph_frame, f"Last: {scores[-1]:.1f}", (10, 90), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-                    cv2.putText(graph_frame, f"Games: {total_points}", (10, 120), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                    cv2.putText(graph_frame, f"Max Score: {max_s:.2f}", (10, 30), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+                    cv2.putText(graph_frame, f"Avg (All {total_points}): {np.mean(scores):.2f}", (10, 60), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+                    cv2.putText(graph_frame, f"Last: {scores[-1]:.2f}", (10, 90), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
                 else:
-                     cv2.putText(graph_frame, "Waiting for games...", (50, 150), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 1)
+                     cv2.putText(graph_frame, "Waiting for games...", (100, 200), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
 
-                cv2.imshow("Score History", graph_frame)
-                cv2.waitKey(1)
+                cv2.imshow("Score History Graph", graph_frame)
+            except: pass
             
-        except Exception:
-            pass 
-            
+            # One-time Window Setup
+            if not self.windows_initialized:
+                 cv2.namedWindow("Battle City AI Training", cv2.WINDOW_AUTOSIZE)
+                 cv2.namedWindow("Score History Graph", cv2.WINDOW_AUTOSIZE)
+                 cv2.moveWindow("Battle City AI Training", 50, 50)
+                 cv2.moveWindow("Score History Graph", 800, 50)
+                 self.windows_initialized = True
+            # render() logic handled via INFO to save bandwidth
+            # We only render the first environment's view
+            try:
+                # Get the frame from INFO (bypassing Agent's blindfold)
+                frame = infos[0].get('render')
+                
+                if frame is not None:
+                    # Resize for Window (84x84 -> 672x672)
+                    frame_img = frame.astype('uint8')
+                    frame_big = cv2.resize(frame_img, (672, 672), interpolation=cv2.INTER_NEAREST)
+                    
+                    # Convert to BGR for Colored Text
+                    display_frame = cv2.cvtColor(frame_big, cv2.COLOR_GRAY2BGR)
+                    
+                    # Draw HUD
+                    kills = infos[0].get('kills', 0)
+                    score = infos[0].get('score', 0.0)
+                    total_steps = self.num_timesteps
+                    
+                    # Top HUD
+                    cv2.putText(display_frame, f"KILLS: {kills}", (20, 35), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2) # Red
+                    cv2.putText(display_frame, f"SCORE: {score:.1f}", (400, 35), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2) # Green
+                    cv2.putText(display_frame, f"Steps: {total_steps}", (20, 650), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2) 
+                    
+                    cv2.imshow("Battle City AI Training", display_frame)
+                    cv2.waitKey(1) # 1ms delay
+                    
+            except Exception as render_err:
+                 # print(f"Render Error: {render_err}")
+                 pass
+        except Exception as e:
+            if self.num_timesteps % 1000 == 0:
+                print(f"\n[DEBUG] CV2 Render Error: {e}")
+            pass
         return True
 
 def train():
@@ -161,88 +178,58 @@ def train():
 
     print(f"--- BATTLE CITY AI TRAINING (VISUAL MODE) ---")
     
-    # Use DummyVecEnv (Single Process Logic)
-    # Pass render_mode=None to Envs (Visualization is handled by Main Process Callback)
-    # Using SubprocVecEnv for Multicore Speed
+    # Use SubprocVecEnv for Multicore Speed
     # Windows Note: SubprocVecEnv requires non-lambda functions usually. 
     # We use a list comprehension of factory functions.
+    
+    # Pass Config to Environment
+    env_kwargs = {'use_vision': config.USE_VISION, 'stack_size': config.STACK_SIZE}
+    
     if config.NUM_CPU > 1:
-        env = SubprocVecEnv([lambda: BattleCityEnv(render_mode=None) for _ in range(config.NUM_CPU)])
+        # We need to import stable_baselines3.common.env_util to use make_vec_env with SubprocVecEnv correctly if not done automatically
+        env = make_vec_env(BattleCityEnv, n_envs=config.NUM_CPU, seed=42, vec_env_cls=SubprocVecEnv, env_kwargs=env_kwargs)
     else:
-        env = DummyVecEnv([lambda: BattleCityEnv(render_mode=None)])
+        env = make_vec_env(BattleCityEnv, n_envs=1, seed=42, vec_env_cls=DummyVecEnv, env_kwargs=env_kwargs)
+
+    # Load or Create Model
+    # Choose Policy Type based on Config
+    policy_type = "MultiInputPolicy" if config.USE_VISION else "MlpPolicy"
     
-    env = VecMonitor(env) # Standard Metrics (ep_rew_mean, etc)
-    
+    print(f"Stats: Vision={config.USE_VISION}, Stack={config.STACK_SIZE}, Policy={policy_type}")
     # Auto-Resume Logic
     latest_model_path = f"{config.MODEL_DIR}/battle_city_interrupted.zip"
     final_model_path = f"{config.MODEL_DIR}/battle_city_final.zip"
     
-    # Smart Load Logic: Find best checkpoint
-    checkpoints = [f for f in os.listdir(config.MODEL_DIR) if f.startswith("battle_city_ppo_") and f.endswith(".zip")]
-    best_checkpoint = None
-    if checkpoints:
-        # Sort by step count (battle_city_ppo_123_steps.zip)
-        try:
-            checkpoints.sort(key=lambda x: int(x.split('_')[3]))
-            best_checkpoint = f"{config.MODEL_DIR}/{checkpoints[-1]}"
-        except:
-            pass
-            
-    latest_model_path = f"{config.MODEL_DIR}/battle_city_interrupted.zip"
-    final_model_path = f"{config.MODEL_DIR}/battle_city_final.zip"
-    
-    # Priority: Best Numbered Checkpoint > Interrupted > Final
-    # (Because Interrupted might be a crashed 0-step model)
-    
-    model_to_load = None
-    if best_checkpoint and os.path.exists(best_checkpoint):
-        model_to_load = best_checkpoint
-    elif os.path.exists(latest_model_path):
-        model_to_load = latest_model_path
+    if os.path.exists(latest_model_path):
+        print(f"Loading interrupted model from {latest_model_path}...")
+        model = PPO.load(latest_model_path, env=env)
+        reset_timesteps = False
     elif os.path.exists(final_model_path):
-        model_to_load = final_model_path
-        
-    if model_to_load:
-        print(f"Loading saved model: {model_to_load}")
-        model = PPO.load(model_to_load, env=env)
-        
-        # Explicitly update hyperparameters
-        model.ent_coef = config.ENT_COEF
-        model.learning_rate = config.LEARNING_RATE
-        model.n_steps = config.N_STEPS
-        model.batch_size = config.BATCH_SIZE
-        model.gamma = config.GAMMA
-        
+        print(f"Loading existing model from {final_model_path}...")
+        model = PPO.load(final_model_path, env=env)
         reset_timesteps = False
     else:
-        # SAFETY CHECK: Do not overwrite existing models accidentally
-        existing_models = [f for f in os.listdir(config.MODEL_DIR) if f.endswith(".zip")]
-        if existing_models:
-             raise RuntimeError(f"❌ SAFETY STOP: Found {len(existing_models)} existing models in '{config.MODEL_DIR}' but failed to load the specific one.\n"
-                                "I will NOT start a fresh training to protect your files.\n"
-                                "Please check file names or delete 'models/' content manually if you want a fresh start.")
-
-        print("Creating NEW BLIND GOD MODEL (2048x1024) - RAM Only...")
-        # One Neuron per Memory Cell Architecture
+        print(f"Creating NEW MODEL ({first_layer_size}x{first_layer_size//2})...")
+        
         policy_kwargs = dict(
             activation_fn=th.nn.ReLU,
-            net_arch=dict(pi=[2048, 1024], vf=[2048, 1024])
+            net_arch=dict(pi=[first_layer_size, first_layer_size//2], vf=[first_layer_size, first_layer_size//2])
         )
         
-        # Using MlpPolicy for Flat RAM Observation
         model = PPO(
-            "MlpPolicy", 
+            policy_type, 
             env, 
             verbose=1,
             tensorboard_log=config.LOG_DIR,
-            learning_rate=config.LEARNING_RATE, 
-            n_steps=config.N_STEPS,          
-            batch_size=config.BATCH_SIZE,       
-            ent_coef=config.ENT_COEF,         
-            gamma=config.GAMMA,
+            learning_rate=config.LEARNING_RATE,
+            n_steps=config.N_STEPS,          # Frequent updates
+            batch_size=config.BATCH_SIZE,       # Standard batch size
+            ent_coef=config.ENTROPY_COEF,         # EXTREME CURIOSITY (Prevent boredom)
+            gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            device="cuda", # Ideally use GPU if installed, otherwise auto-fallbacks
+            # ent_coef=0.1, (Removed duplicate)
+            device="cuda",
             policy_kwargs=policy_kwargs
         )
         reset_timesteps = True
@@ -274,7 +261,9 @@ def train():
             print(f"\n[CRITICAL] Training Interrupted/Crashed: {e}")
             
         print("Saving EMERGENCY model...")
+        print("Saving EMERGENCY model...")
         model.save(f"{config.MODEL_DIR}/battle_city_interrupted")
+        print("Saved.")
         print("Saved.")
         
     finally:

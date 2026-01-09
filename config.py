@@ -1,32 +1,24 @@
-# ==========================================
-#         BATTLE CITY AI CONFIG
-# ==========================================
+# BATTLE CITY AI - CONFIGURATION FILE
 
-# --- SYSTEM & HARDWARE ---
-# Number of parallel environments. 
-# On Colab (2 cores), keep this around 8-16. 
-# On powerful PC (24 cores), go for 48-64.
-NUM_CPU = 48 
+# --- ENVIRONMENT SETTINGS ---
+USE_VISION = True   # Set True to enable Vision (Pixels) + RAM. False = RAM Only (Faster).
+STACK_SIZE = 4       # Number of Frames/RAM-dumps to stack (Temporal Context). 
+                     # Higher = More "Memory" of movement, but bigger inputs.
 
-# --- TRAINING DURATION ---
-# Total number of frames/steps to train for.
-# 1 Million = ~1 hour on fast PC.
-# 5 Million = Good for "Master" level.
-TOTAL_TIMESTEPS = 5_000_000 
+# --- TRAINING SETTINGS ---
+NUM_CPU = 24         # Number of parallel environments (Processes).
+                     # Recommended: Count of Logical Processors on your CPU.
+                     
+TOTAL_TIMESTEPS = 5_000_000  # Total frames to train for.
+CHECKPOINT_FREQ = 10_000     # Save model every N steps.
 
-# --- SAVING ---
-# How often to save the model (in steps).
-CHECKPOINT_FREQ = 10_000
+# --- HYPERPARAMETERS ---
+LEARNING_RATE = 0.00001 # 1e-5: Very slow and stable. Good for preventing collapse.
+ENTROPY_COEF = 0.2      # 0.2: High curiosity. Forces agent to try new things.
+BATCH_SIZE = 256
+N_STEPS = 512           # Steps per update per env.
+
+# --- PATHS ---
 MODEL_DIR = "models"
 LOG_DIR = "logs"
-
-# --- PPO HYPERPARAMETERS ---
-# Advanced users only.
-LEARNING_RATE = 0.00001  # Slow & Careful
-N_STEPS       = 2048     # Increased for higher FPS (less frequent updates)
-BATCH_SIZE    = 512      # Increased Batch size
-ENT_COEF      = 0.1     # Entropy: Lowered to 0.05 to stabilize mastery.
-GAMMA         = 0.99     # Discount factor
-
-# --- SAFETY ---
-ALLOW_NEW_MODEL = False # If True, will restart from scratch if no model found. If False, CRASHES.
+ROM_PATH = 'BattleCity_fixed.nes'

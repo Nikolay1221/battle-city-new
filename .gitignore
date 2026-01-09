@@ -1,24 +1,43 @@
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
+
+# C extensions
 *.so
 
-# Models & Logs (Heavy files)
-models/
-logs/
-*.zip
-*.pkl
-training_log.txt
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# Environment specific
-.env
+# Virtual environments
 venv/
 env/
+ENV/
+.env
+.venv/
 
-# Editor
+# IDEs
 .vscode/
 .idea/
 
-# OS
-Thumbs.db
-Desktop.ini
+# Project specific
+logs/
+models/
+*.nes

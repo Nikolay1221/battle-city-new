@@ -9,11 +9,13 @@ from collections import deque
 class BattleCityEnv(gym.Env):
     metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 60}
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, use_vision=False, stack_size=4):
         super(BattleCityEnv, self).__init__()
         
         ROM_PATH = 'BattleCity_fixed.nes' 
         self.render_mode = render_mode
+        self.USE_VISION = use_vision
+        self.STACK_SIZE = stack_size
         
         # Raw Env
         self.raw_env = NESEnv(ROM_PATH)
@@ -40,11 +42,22 @@ class BattleCityEnv(gym.Env):
         # We manually redefine the action space to match.
         self.action_space = spaces.Discrete(len(actions))
 
-        # Observation Space: FLAT RAM (MLP Friendly)
-        # No Dictionary. Just pure 2048 numbers. This is fastest.
-        # "Blind Mode" - Agent sees only the Matrix code.
-        self.observation_space = spaces.Box(low=0, high=255, shape=(2048,), dtype=np.uint8)
+        # Dynamic Observation Space
+        ram_size = 2048 * self.STACK_SIZE
         
+        if self.USE_VISION:
+            # DICT: Screen + RAM
+            self.observation_space = spaces.Dict({
+                "screen": spaces.Box(low=0, high=255, shape=(84, 84, self.STACK_SIZE), dtype=np.uint8),
+                "ram": spaces.Box(low=0.0, high=1.0, shape=(ram_size,), dtype=np.float32)
+            })
+        else:
+            # BOX: RAM Only
+            self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(ram_size,), dtype=np.float32)
+        
+        # RAM Stack Buffer
+        self.ram_stack = deque(maxlen=self.STACK_SIZE)
+
         # Load Templates
         self.game_over_tmpl = cv2.imread('templates/game_over.png', cv2.IMREAD_GRAYSCALE)
         if self.game_over_tmpl is None:
@@ -57,13 +70,8 @@ class BattleCityEnv(gym.Env):
         self.ADDR_BONUS = 0x62
         self.ADDR_STAGE = 0x85
         
-        # Scanner & Helper Vars
-        self.valid_actions = actions
-        
-        # Initialize Previous State
         self.prev_lives = 3
-        self.prev_kills = 0
-        self.prev_score = 0
+        self.prev_kills = [0, 0, 0, 0]
         self.prev_bonus = 0
         self.prev_stage = 0
         
@@ -83,35 +91,61 @@ class BattleCityEnv(gym.Env):
         self.MAX_STEPS = 5000 
         
         # Frame Stack Buffer
-        # self.frames = deque(maxlen=4) # Removed for RAM-only observation
+        self.frames = deque(maxlen=self.STACK_SIZE)
 
-    # Removed _process_frame as screen is no longer observed
+    def _process_frame(self, obs):
+        """Resize to 84x84 and Grayscale"""
+        gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
+        return resized # (84, 84)
 
     def _get_obs(self):
-        """
-        Get RAM State (2KB).
-        Optimization: No screen capture, no OpenCV, no resizing.
-        Pure memory read (Microseconds).
-        """
+        # ... (Image processing handled by frames stack, assumed done in step/reset) ...
+        # 2. RAM Stack
         raw_ram = self.raw_env.ram
-        # Take first 2048 bytes
-        return np.array(raw_ram[:2048], dtype=np.uint8)
+        # Normalize IMMEDIATELY (0-255 -> 0.0-1.0)
+        current_ram_snap = np.array(raw_ram[:2048], dtype=np.float32) / 255.0
+        
+        # Add to stack
+        self.ram_stack.append(current_ram_snap)
+        
+        # Fill if empty (first frame)
+        while len(self.ram_stack) < self.STACK_SIZE:
+             self.ram_stack.append(current_ram_snap)
+             
+        # Flatten Stack: [Frame1, Frame2, Frame3, Frame4] -> Vector
+        ram_obs = np.concatenate(self.ram_stack) 
+        
+        if not self.USE_VISION:
+            return ram_obs # Return ONLY vector (Box Space)
+
+        # 1. Screen (Only if USE_VISION)
+        if len(self.frames) < self.STACK_SIZE:
+            screen_obs = np.zeros((self.STACK_SIZE, 84, 84), dtype=np.uint8)
+        else:
+            screen_obs = np.array(self.frames, dtype=np.uint8)
+            
+        # Transpose to (H, W, C) for Stable Baselines CnnPolicy
+        screen_obs = np.moveaxis(screen_obs, 0, -1)
+            
+        return {
+            "screen": screen_obs,
+            "ram": ram_obs
+        }
 
     def reset(self, seed=None, options=None):
-        if seed is not None:
-             super().reset(seed=seed)
-        
-        # Frame Stacking Buffer
-        self.frames = deque(maxlen=4)
+        super().reset(seed=seed)
         
         # self.raw_env is accessible.
-        
-        obs = self.raw_env.reset() # Reset Raw Env
+        self.raw_env.reset()
         
         self.steps_in_episode = 0
         self.episode_score = 0.0 # Reset score
         self.visited_sectors = set() # Track visited 16x16 zones
+        
+        # Clear Buffers
         self.frames.clear()
+        self.ram_stack.clear()
         
         # Auto-Skip Menu using RAW ENV actions (byte)
         # Start button is 0x08 (bit 3) -> 8
@@ -154,10 +188,16 @@ class BattleCityEnv(gym.Env):
         self.prev_y = int(self.raw_env.ram[self.ADDR_Y])
         self.idle_steps = 0
         
-        # Initial Frame Processing - SKIPPED (RAM Mode)
-        # processed = self._process_frame(obs)
-        # for _ in range(4):
-        #     self.frames.append(processed)
+        # Initial Frame Processing
+        obs = self.raw_env.screen # Define obs
+        processed = self._process_frame(obs)
+        for _ in range(self.STACK_SIZE):
+            self.frames.append(processed)
+            
+        # Fill RAM Stack (Initialize with current state)
+        initial_ram = np.array(self.raw_env.ram[:2048], dtype=np.float32) / 255.0
+        for _ in range(self.STACK_SIZE):
+            self.ram_stack.append(initial_ram)
             
         return self._get_obs(), {} # Return (Obs, Info) for Gymnasium
         
@@ -178,9 +218,12 @@ class BattleCityEnv(gym.Env):
         
         self.steps_in_episode += 1 
         
-        # Process Frame (SKIPPED in RAM Mode)
-        # processed = self._process_frame(obs)
-        # self.frames.append(processed)
+        # Process and Push new frame
+        processed = self._process_frame(obs)
+        self.frames.append(processed)
+        
+        info = {}
+        info['render'] = processed # FOR VISUALIZATION WINDOW (Bypass Agent)
         
         ram = self.raw_env.ram # Access RAM from raw env
         reward = 0 
@@ -237,8 +280,16 @@ class BattleCityEnv(gym.Env):
         
         if max_val > 0.7: 
              terminated = True # Game Over = Terminated
-             reward -= 1.0 # Normalized (-10.0 -> -1.0)
-             # print(f"DEBUG: Game Over Screen Detected! (Score: {max_val:.2f})")
+             
+             # HEAVY PENALTY FOR BASE DESTRUCTION
+             # If game ended but we didn't lose a life -> Base was destroyed!
+             if curr_lives >= self.prev_lives:
+                 reward -= 5.0 # Massive punishment for losing base
+                 # print("DEBUG: BASE DESTROYED! Punishment: -5.0")
+             else:
+                 reward -= 1.0 # Standard Game Over (Ran out of lives)
+
+    # (Fixing reset RAM type below in separate chunk if needed, but I'll try to do it here if close enough? No, 276 is far from 193. Need MultiReplace)
              
         # RAM Check Disabled (User reported non-functional)
         # if int(ram[self.ADDR_STATE]) == 0xE0: ... 
@@ -293,10 +344,7 @@ class BattleCityEnv(gym.Env):
         self.episode_score += reward
         info['score'] = self.episode_score
 
-        # DEBUG: Verify Agent "Vision" and "Action"
-        # Print every 60 steps (1 sec)
-        # if self.steps_in_episode % 60 == 0:
-        #    pass
+
 
         return self._get_obs(), reward, terminated, truncated, info
 
