@@ -40,6 +40,11 @@ def main():
             if event.type == pygame.QUIT: running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE: running = False
+                elif event.key == pygame.K_k: 
+                    print("CHEAT: Clearing Enemies!")
+                    env.cheat_clear_enemies()
+                elif event.key == pygame.K_j:
+                    env.toggle_sandbox_mode()
         
         # Input
         keys = pygame.key.get_pressed()
@@ -124,14 +129,30 @@ def main():
         y_pos += 20
         
         # 2. Base
-        base_tile = ram[0x07D3]
-        if base_tile == 0x0C:
-            base_txt = "BASE: OK (0x0C)"
-            base_col = (0, 255, 0)
+        # 2. Base
+        base_status = ram[0x68]
+        latch = getattr(env, 'base_active_latch', False)
+        
+        if latch:
+             status_txt = f"LATCHED (ACTIVE)"
+             status_col = (255, 255, 0)
         else:
-            base_txt = f"BASE: DESTROYED (0x{base_tile:02X})"
-            base_col = (255, 0, 0)
+             status_txt = "WAITING..."
+             status_col = (100, 100, 100)
+             
+        if base_status == 0 and latch:
+             base_txt = f"BASE: DESTROYED (0x{base_status:02X})"
+             base_col = (255, 0, 0)
+        elif base_status != 0:
+             base_txt = f"BASE: ALIVE (0x{base_status:02X})"
+             base_col = (0, 255, 0)
+        else:
+             base_txt = f"BASE: INIT (0x{base_status:02X})"
+             base_col = (100, 100, 255)
+
         screen.blit(font_mono.render(base_txt, True, base_col), (x_start, y_pos))
+        y_pos += 15
+        screen.blit(font_mono.render(status_txt, True, status_col), (x_start, y_pos))
         y_pos += 20
         
         # 3. Enemies

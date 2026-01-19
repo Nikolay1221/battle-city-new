@@ -21,7 +21,8 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNorm
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 from battle_city_env import BattleCityEnv
-from virtual_env import VirtualBattleCityEnv # Import Virtual Env
+from battle_city_env import BattleCityEnv
+# from virtual_env import VirtualBattleCityEnv # No longer used
 import config 
 
 # --- CALLBACKS ---
@@ -311,19 +312,23 @@ def make_hybrid_env(rank, seed=0):
         num_virtual = getattr(config, 'NUM_VIRTUAL', config.NUM_CPU // 2)
         
         if rank < num_virtual:
-            env = VirtualBattleCityEnv(render_mode='rgb_array')
-            # SYNC REWARDS WITH REAL ENV TO PREVENT CHEATING
-            env.rew_explore = 0.01 
+            # SANDBOX MODE ('Virtual' Learning using Real Env)
+            env = BattleCityEnv(
+                render_mode='rgb_array',
+                stack_size=config.STACK_SIZE,
+                target_stage=getattr(config, 'TARGET_STAGE', None),
+                sandbox_mode=True # ENABLE SANDBOX for Map Learning
+            )
         else:
             env = BattleCityEnv(
                 render_mode='rgb_array',
                 stack_size=config.STACK_SIZE,
-                target_stage=getattr(config, 'TARGET_STAGE', None)
+                target_stage=getattr(config, 'TARGET_STAGE', None),
+                sandbox_mode=False # REAL COMBAT
             )
-            # HARDCORE MODE ENABLED BY DEFAULT
-            env.rew_kill = 2.0
-            env.rew_death = -2.0
-            env.rew_explore = 0.01
+            
+        # Unified rewards are now handled in BattleCityEnv via config.py
+        # No manual overrides needed here.
             
         env.reset(seed=seed + rank)
         # Monitor with extra keywords (Added env_type)
@@ -342,8 +347,8 @@ def train():
 
     if getattr(config, 'USE_HYBRID', False):
         num_virtual = getattr(config, 'NUM_VIRTUAL', config.NUM_CPU // 2)
-        print(f">> MODE: HYBRID (Virtual + Real)")
-        print(f"   Processes 0-{num_virtual - 1}: Virtual Map Learning")
+        print(f">> MODE: HYBRID (Real Sandbox + Real Combat)")
+        print(f"   Processes 0-{num_virtual - 1}: Sandbox Map Learning (Real Env, No Enemies)")
         print(f"   Processes {num_virtual}-{config.NUM_CPU - 1}: Real Combat")
         
         # Create list of env constructors manually
