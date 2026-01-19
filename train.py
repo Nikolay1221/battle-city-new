@@ -9,594 +9,464 @@ from collections import deque
 from stable_baselines3 import PPO
 import torch
 import torch.nn as nn
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
+# SB3 Contrib is optional
 try:
     from sb3_contrib import RecurrentPPO
 except ImportError:
-    print("Warning: sb3-contrib not installed. RecurrentPPO unavailable.")
     RecurrentPPO = None
 
-
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
-from stable_baselines3.common.env_util import make_vec_env # Needed for dynamic kwargs
-from stable_baselines3.common.vec_env import VecNormalize # <--- Added
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.monitor import Monitor
 from battle_city_env import BattleCityEnv
-import torch as th # Added for Architecture Config
+from virtual_env import VirtualBattleCityEnv # Import Virtual Env
+import config 
 
-import torch as th # Added for Architecture Config
-import config # <--- IMPORT CONFIG
+# --- CALLBACKS ---
 
-def linear_schedule(initial_value: float):
+class KLAdaptiveLRCallback(BaseCallback):
     """
-    Linear learning rate schedule.
-    :param initial_value: The initial learning rate.
-    :return: schedule that computes current learning rate depending on remaining progress
+    Proportional KL-Adaptive Learning Rate Controller.
+    Adjusts LR to keep approx_kl close to target_kl.
+    Formula: new_lr = old_lr * (target_kl / approx_kl)
     """
-    if isinstance(initial_value, str):
-        initial_value = float(initial_value)
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.current_lr = config.LR_START
+        self.min_lr = config.LR_MIN
+        self.max_lr = config.LR_MAX
+        self.target_kl = config.TARGET_KL
 
-    def func(progress_remaining: float) -> float:
-        """
-        Progress will decrease from 1 (beginning) to 0.
-        """
-        return progress_remaining * initial_value
-    return func
+    def _on_step(self) -> bool:
+        return True
 
-# Network Architecture calculation (Dependent on Config)
-# 2048 bytes * STACK_SIZE
-first_layer_size = 1024 * config.STACK_SIZE 
-if first_layer_size < 512: first_layer_size = 512
+    def on_rollout_start(self) -> None:
+        # Get approx_kl from the last update
+        if not hasattr(self.logger, 'name_to_value'):
+            return
+
+        approx_kl = self.logger.name_to_value.get("train/approx_kl", None)
+        
+        if approx_kl is not None and approx_kl > 1e-6: # Avoid division by zero
+            # Proportional adjustment
+            # We clamp the ratio to avoid wild swings (e.g., max 2x change per step)
+            ratio = self.target_kl / approx_kl
+            ratio = max(0.5, min(2.0, ratio)) 
+            
+            self.current_lr *= ratio
+            
+            # Clip to global bounds
+            self.current_lr = max(self.min_lr, min(self.max_lr, self.current_lr))
+            
+            if self.verbose > 0:
+                print(f"KL {approx_kl:.5f} | Target {self.target_kl} | Ratio {ratio:.2f} -> New LR {self.current_lr:.2e}")
+            
+            # Apply to optimizer
+            self.model.learning_rate = self.current_lr
+            for param_group in self.model.policy.optimizer.param_groups:
+                param_group['lr'] = self.current_lr
+                
+            self.logger.record("train/learning_rate", self.current_lr)
 
 class ConsoleLoggerCallback(BaseCallback):
     def __init__(self, verbose=0):
-        super(ConsoleLoggerCallback, self).__init__(verbose)
-        self.last_time_steps = 0
+        super().__init__(verbose)
+        # Global accumulators (ONLY FOR REAL ENV)
+        self.total_episodes = 0
+        self.cum_reward = 0.0
+        self.cum_kills = 0.0
+        self.cum_explore = 0.0
+        self.cum_length = 0.0
 
     def _on_step(self) -> bool:
-        # Print every 1000 steps
-        if self.num_timesteps % 1000 == 0:
-            mean_rew = "N/A"
-            if len(self.model.ep_info_buffer) > 0:
-                mean_rew = f"{sum([ep['r'] for ep in self.model.ep_info_buffer]) / len(self.model.ep_info_buffer):.2f}"
-            print(f"[{self.num_timesteps} steps] Mean Reward: {mean_rew} (Playing...)", end='\r')
-        return True
+        # Check for completed episodes in the current step
+        # 'dones' tells us if an env finished, 'infos' contains the stats
+        for info in self.locals['infos']:
+            if 'episode' in info:
+                # Check if this is a REAL environment (env_type == 1)
+                # If 'env_type' is missing, assume it's real (legacy support)
+                is_real = info.get('env_type', 1) == 1
+                
+                if is_real:
+                    ep_data = info['episode']
+                    self.total_episodes += 1
+                    self.cum_reward += ep_data['r']
+                    self.cum_length += ep_data['l']
+                    self.cum_kills += ep_data.get('kills', 0)
+                    self.cum_explore += ep_data.get('exploration_pct', 0)
 
-import traceback
+        if self.num_timesteps % 1000 == 0:
+            # --- ROLLING STATS (Last 100 episodes - FILTERED) ---
+            roll_rew = "N/A"
+            roll_kills = "N/A"
+            roll_explore = "N/A"
+            
+            if len(self.model.ep_info_buffer) > 0:
+                # Filter buffer for real envs only
+                # Note: ep_info_buffer stores the raw info dicts
+                real_eps = [ep for ep in self.model.ep_info_buffer if ep.get('env_type', 1) == 1]
+                
+                if len(real_eps) > 0:
+                    roll_rew = np.mean([ep['r'] for ep in real_eps])
+                    roll_kills = np.mean([ep.get('kills', 0) for ep in real_eps])
+                    roll_explore = np.mean([ep.get('exploration_pct', 0) for ep in real_eps])
+                
+                    # Log Rolling to TensorBoard
+                    self.logger.record("rollout/mean_kills", roll_kills)
+                    self.logger.record("rollout/mean_explore_pct", roll_explore)
+
+            # --- GLOBAL STATS (Since start of script) ---
+            glob_rew = 0.0
+            glob_kills = 0.0
+            glob_explore = 0.0
+            glob_len = 0.0
+            
+            if self.total_episodes > 0:
+                glob_rew = self.cum_reward / self.total_episodes
+                glob_kills = self.cum_kills / self.total_episodes
+                glob_explore = self.cum_explore / self.total_episodes
+                glob_len = self.cum_length / self.total_episodes
+
+            # Log Global to TensorBoard
+            self.logger.record("global/mean_reward", glob_rew)
+            self.logger.record("global/mean_kills", glob_kills)
+            self.logger.record("global/mean_explore_pct", glob_explore)
+            self.logger.record("global/mean_ep_length", glob_len)
+            self.logger.record("global/total_episodes", self.total_episodes)
+
+            # --- CONSOLE OUTPUT ---
+            # Format: [Step] | R: Roll(Glob) | K: Roll(Glob) | Exp: Roll(Glob)%
+            r_str = f"{roll_rew:.1f}" if isinstance(roll_rew, float) else roll_rew
+            k_str = f"{roll_kills:.1f}" if isinstance(roll_kills, float) else roll_kills
+            e_str = f"{roll_explore:.1f}" if isinstance(roll_explore, float) else roll_explore
+            
+            print(f"[{self.num_timesteps}] "
+                  f"Rew: {r_str}({glob_rew:.1f}) | "
+                  f"Kills: {k_str}({glob_kills:.1f}) | "
+                  f"Exp: {e_str}%({glob_explore:.1f}%) | "
+                  f"Len: {glob_len:.0f}", 
+                  end='\r')
+
+        return True
 
 class RenderCallback(BaseCallback):
     def __init__(self, verbose=0):
-        super(RenderCallback, self).__init__(verbose)
-        self.windows_initialized = False # Flag for window setup
-        self.history_path = f"{config.MODEL_DIR}/score_history.pkl"
+        super().__init__(verbose)
+        self.windows_initialized = False 
         
-        # HEADLESS AUTO-DETECT
-        # 1. Config override
-        # 2. 'DISPLAY' env var missing (Linux/Colab)
-        if getattr(config, 'HEADLESS_MODE', False) or (os.name == 'posix' and 'DISPLAY' not in os.environ):
-             print("[System] HEADLESS MODE DETECTED (Colab/Server). GUI Disabled.")
-             self.windows_initialized = "HEADLESS" # Permanently disable rendering
-        
-        # Load History if exists
-        if os.path.exists(self.history_path):
-            try:
-                with open(self.history_path, 'rb') as f:
-                    self.score_history = pickle.load(f)
-                print(f"[Graph] Loaded history: {len(self.score_history)} games.")
-            except Exception as e:
-                print(f"[Graph] Load failed: {e}")
-                self.score_history = deque() # Unlimited
-        else:
-            self.score_history = deque() # Unlimited
+        if getattr(config, 'HEADLESS_MODE', False):
+             self.windows_initialized = "HEADLESS"
         
     def _on_step(self) -> bool:
+        if self.windows_initialized == "HEADLESS": return True
+        
         try:
-            # ... (Existing logic for collecting scores) ...
-            # Detect End of Episode to Record Score
-            dones = self.locals.get('dones', [False])
-            infos = self.locals.get('infos', [{}])
+            # Access the VecEnv
+            vec_env = self.model.get_env()
             
-            # Check ALL environments for finished games
-            any_finished = False
-            for i, done in enumerate(dones):
-                if done:
-                    final_score = infos[i].get('score', 0)
-                    # NEW: Store Tuple (Score, Timestep)
-                    self.score_history.append((final_score, self.num_timesteps))
-                    any_finished = True
+            # Call 'get_tactical_rgb' on ALL envs
+            grid_images = vec_env.env_method("get_tactical_rgb")
             
-            if any_finished:
-                # Save History (If any game finished)
-                try:
-                    with open(self.history_path, 'wb') as f:
-                        pickle.dump(self.score_history, f)
-                except Exception as e:
-                    print(f"[Graph] Save failed: {e}")
-                
-                # --- LOG STATS TO CONSOLE (USER REQUEST) ---
-                try:
-                    # Extract just scores
-                    all_scores = []
-                    # Optimization: If history is huge, maybe slice? But 100k is fine.
-                    for item in self.score_history:
-                        if isinstance(item, (tuple, list)):
-                             all_scores.append(float(item[0]))
-                        else:
-                             all_scores.append(float(item))
-                    
-                    if all_scores:
-                        self.logger.record("rollout/max_score", max(all_scores))
-                        self.logger.record("rollout/avg_score_all", np.mean(all_scores))
-                        self.logger.record("rollout/last_score", all_scores[-1])
-                except Exception:
-                    pass
+            if not grid_images: return True
 
-            current_obs = self.locals.get('new_obs')
+            # Calculate Grid Dimensions
+            n_envs = len(grid_images)
             
-            # --- SCORE GRAPH (SEPARATE WINDOW) ---
-            # Update Graph window every step (it's fast)
-            if self.windows_initialized == "HEADLESS":
-                return True # Skip rendering
-                
-            try:
-                # Create black canvas
-                g_w, g_h = 800, 400 
-                graph_frame = np.zeros((g_h, g_w, 3), dtype=np.uint8)
-
-                if len(self.score_history) > 1:
-                    scores = []
-                    steps = []
-                    for i, item in enumerate(self.score_history):
-                        try:
-                            if isinstance(item, tuple) or isinstance(item, list):
-                                if len(item) >= 2:
-                                    scores.append(float(item[0]))
-                                    steps.append(int(item[1]))
-                                elif len(item) == 1:
-                                    scores.append(float(item[0]))
-                                    steps.append(0)
-                            else:
-                                scores.append(float(item))
-                                steps.append(0)
-                        except: continue
-                        
-                    if not scores: return True # Skip if empty after filtering
-                    
-                    min_s, max_s = min(scores), max(scores)
-                    if max_s == min_s: max_s += 1 
-                    
-                    # Dynamic X-Scale
-                    total_points = len(scores)
-                    
-                    # Colors for Cycles (Rainbow-ish)
-                    # BGR format
-                    colors = [
-                        (0, 0, 255),    # Red
-                        (0, 165, 255),  # Orange
-                        (0, 255, 255),  # Yellow
-                        (0, 255, 0),    # Green
-                        (255, 255, 0),  # Cyan
-                        (255, 0, 0),    # Blue
-                        (255, 0, 255),  # Magenta
-                    ]
-                    
-                    for i in range(1, total_points):
-                        p1_val = scores[i-1]
-                        p2_val = scores[i]
-                        
-                        # Determine Color based on Step Count of the SECOND point
-                        # Cycle changes every config.N_STEPS
-                        step_val = steps[i]
-                        cycle_idx = (step_val // config.N_STEPS) % len(colors)
-                        line_color = colors[cycle_idx]
-                        
-                        # Scales
-                        x1 = int((i-1) * (g_w / (total_points - 1)))
-                        x2 = int(i * (g_w / (total_points - 1)))
-                        
-                        # Invert Y (0 is top)
-                        y1 = int((g_h - 20) - ((p1_val - min_s) / (max_s - min_s)) * (g_h - 40))
-                        y2 = int((g_h - 20) - ((p2_val - min_s) / (max_s - min_s)) * (g_h - 40))
-                        
-                        cv2.line(graph_frame, (x1, y1), (x2, y2), line_color, 2) # Thicker line (2)
-                        
-                        # Only draw dots if not too crowded
-                        if total_points < 100:
-                            cv2.circle(graph_frame, (x2, y2), 3, (255, 255, 255), -1)
-
-                    # Stats Text
-                    cv2.putText(graph_frame, f"Max Score: {max_s:.2f}", (10, 30), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
-                    cv2.putText(graph_frame, f"Avg (All {total_points}): {np.mean(scores):.2f}", (10, 60), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
-                    cv2.putText(graph_frame, f"Last: {scores[-1]:.2f}", (10, 90), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
-                    
-                    # Current Cycle Info
-                    current_cycle = self.num_timesteps // config.N_STEPS
-                    cv2.putText(graph_frame, f"Update Cycle: {current_cycle}", (550, 30), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, colors[current_cycle % len(colors)], 2)
-                                
-                else:
-                     cv2.putText(graph_frame, "Waiting for games...", (100, 200), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-
-                cv2.imshow("Score History Graph", graph_frame)
-            except Exception as e: 
-                # print(f"Graph Error: {e}")
-                pass
+            # Force 4 columns layout for better fit
+            cols = 4
+            rows = int(np.ceil(n_envs / cols))
             
-            # One-time Window Setup
+            # Fill empty slots
+            while len(grid_images) < rows * cols:
+                grid_images.append(np.zeros((52, 52, 3), dtype=np.uint8))
+
+            # Stitch Rows
+            final_rows = []
+            for r in range(rows):
+                row_imgs = grid_images[r*cols : (r+1)*cols]
+                # Horizontal stack
+                row_line = np.hstack(row_imgs)
+                final_rows.append(row_line)
+            
+            # Vertical stack
+            full_grid = np.vstack(final_rows)
+
+            # Resize for visibility (Scale x6 for 52px -> 312px blocks)
+            # Increased to x6 for better visibility
+            scale = 6
+            h, w = full_grid.shape[:2]
+            
+            # Convert RGB to BGR for OpenCV
+            full_grid_bgr = cv2.cvtColor(full_grid, cv2.COLOR_RGB2BGR)
+            
+            display_grid = cv2.resize(full_grid_bgr, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+            
+            # Add thick grid lines between environments
+            for i in range(1, cols):
+                x = i * 52 * scale
+                cv2.line(display_grid, (x, 0), (x, h*scale), (255, 255, 255), 2)
+            for i in range(1, rows):
+                y = i * 52 * scale
+                cv2.line(display_grid, (0, y), (w*scale, y), (255, 255, 255), 2)
+
+            # Add internal cell grid (subtle) - every 4 cells (16 pixels)
+            for i in range(w // 52 * 52 + 1):
+                x = i * scale
+                if x % (52 * scale) != 0:
+                    # Draw grid every 4 cells (to mimic 16x16 blocks)
+                    if i % 4 == 0:
+                        cv2.line(display_grid, (x, 0), (x, h*scale), (40, 40, 40), 1)
+            for i in range(h // 52 * 52 + 1):
+                y = i * scale
+                if y % (52 * scale) != 0:
+                    if i % 4 == 0:
+                        cv2.line(display_grid, (0, y), (w*scale, y), (40, 40, 40), 1)
+
             if not self.windows_initialized:
-                try:
-                     cv2.namedWindow("Battle City AI Training", cv2.WINDOW_AUTOSIZE)
-                     cv2.namedWindow("Score History Graph", cv2.WINDOW_AUTOSIZE)
-                     cv2.moveWindow("Battle City AI Training", 50, 50)
-                     cv2.moveWindow("Score History Graph", 800, 50)
-                     self.windows_initialized = True
-                except Exception as e:
-                    print(f"\n[WARNING] Could not open display: {e}. Switching to HEADLESS MODE (Console only).")
-                    self.windows_initialized = "HEADLESS"
+                cv2.namedWindow("BATTLE CITY - 8 PARALLEL WORLDS", cv2.WINDOW_AUTOSIZE)
+                self.windows_initialized = True
 
-            if self.windows_initialized == "HEADLESS":
-                return True # Skip rendering
-                
-            # render() logic handled via INFO to save bandwidth
-            # We only render the first environment's view
-            try:
-                # Get the frame from INFO (bypassing Agent's blindfold)
-                frame = infos[0].get('render')
-                
-                if frame is not None:
-                    # Resize for Window (84x84 -> 672x672)
-                    frame_img = frame.astype('uint8')
-                    frame_big = cv2.resize(frame_img, (672, 672), interpolation=cv2.INTER_NEAREST)
-                    
-                    # Convert to BGR for Colored Text
-                    display_frame = cv2.cvtColor(frame_big, cv2.COLOR_GRAY2BGR)
-                    
-                    # Draw HUD
-                    kills = infos[0].get('kills', 0)
-                    score = infos[0].get('score', 0.0)
-                    total_steps = self.num_timesteps
-                    
-                    # Top HUD
-                    cv2.putText(display_frame, f"KILLS: {kills}", (20, 35), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2) # Red
-                    cv2.putText(display_frame, f"SCORE: {score:.1f}", (400, 35), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2) # Green
-                    cv2.putText(display_frame, f"Steps: {total_steps}", (20, 650), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2) 
-                    
-                    cv2.imshow("Battle City AI Training", display_frame)
-                    cv2.waitKey(1) # 1ms delay
-                    
-            except Exception as render_err:
-                 # print(f"Render Error: {render_err}")
-                 pass
+            cv2.imshow("BATTLE CITY - 8 PARALLEL WORLDS", display_grid)
+            cv2.waitKey(1)
+
         except Exception as e:
-            if self.num_timesteps % 1000 == 0:
-                print(f"\n[DEBUG] CV2 Render Error: {e}")
-            pass
+            pass # print(f"Render Error: {e}")
         return True
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=512):
+# --- TRAIN FUNCTION ---
+
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+class ResBlock(nn.Module):
+    """
+    Residual Block for deeper reasoning without gradient vanishing.
+    Input -> Conv -> ReLU -> Conv -> (+ Input) -> ReLU
+    """
+    def __init__(self, n_channels):
         super().__init__()
-        # Create constant 'pe' matrix with values dependent on pos and i
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))
+        self.conv = nn.Sequential(
+            nn.Conv2d(n_channels, n_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(n_channels, n_channels, kernel_size=3, padding=1)
+        )
+        self.relu = nn.ReLU()
 
     def forward(self, x):
-        # x: [Batch, SeqLen, Dim]
-        # Add position encoding to the embedding
-        return x + self.pe[:, :x.size(1), :]
+        return self.relu(x + self.conv(x))
 
-class TransformerFeatureExtractor(BaseFeaturesExtractor):
+class CustomTacticalCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 512):
-        # Observation space is (N_STACK * RAM_SIZE) flattened
-        # We assume input is (Batch, STACK_SIZE * RAM_SIZE)
-        
         super().__init__(observation_space, features_dim)
+        n_input_channels = observation_space.shape[0] 
         
-        self.stack_size = config.STACK_SIZE
-        # self.ram_size = 2048 # Fixed NES RAM (DEPRECATED)
-        # Calculate Input Feature Size dynamically (e.g., 32 or 2048)
-        self.ram_size = observation_space.shape[0] // self.stack_size
-        self.d_model = 512   # Embedding Size
-        self.nhead = 8
-        self.num_layers = 4
-        
-        # Project RAM (2048) -> Embedding (512)
-        self.input_net = nn.Sequential(
-            nn.Linear(self.ram_size, self.d_model),
-            nn.ReLU()
+        # 1. Initial Feature Extraction (Scale down)
+        self.initial_conv = nn.Sequential(
+            nn.Conv2d(n_input_channels, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), # 26x26
+            nn.ReLU(),
         )
         
-        self.pos_encoder = PositionalEncoding(self.d_model, max_len=self.stack_size)
+        # 2. Deep Reasoning (ResNet Blocks) - Keep size 26x26
+        self.res_blocks = nn.Sequential(
+            ResBlock(128),
+            ResBlock(128),
+            ResBlock(128)
+        )
         
-        encoder_layer = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=self.nhead, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.num_layers)
+        # 3. Final Compression
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1), # 13x13
+            nn.ReLU(),
+            nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1), # 7x7
+            nn.ReLU(),
+            nn.Flatten()
+        )
+
+        # Compute shape
+        with torch.no_grad():
+            sample = torch.as_tensor(observation_space.sample()[None]).float()
+            x = self.initial_conv(sample)
+            x = self.res_blocks(x)
+            n_flatten = self.final_conv(x).shape[1]
+
+        self.linear = nn.Sequential(nn.Linear(n_flatten, features_dim), nn.ReLU())
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        # Input: (Batch, STACK_SIZE * RAM_SIZE)
-        batch_size = observations.shape[0]
+        x = self.initial_conv(observations)
+        x = self.res_blocks(x)
+        x = self.final_conv(x)
+        return self.linear(x)
+
+def make_hybrid_env(rank, seed=0):
+    """
+    Factory function for hybrid environment creation.
+    Rank 0 to NUM_VIRTUAL-1: Virtual Env (Map Learning)
+    Rank NUM_VIRTUAL to NUM_CPU-1: Real Env (Combat)
+    """
+    def _init():
+        # Use config.NUM_VIRTUAL to decide split
+        num_virtual = getattr(config, 'NUM_VIRTUAL', config.NUM_CPU // 2)
         
-        # Reshape to (Batch, Stack, RAM)
-        # Verify shape logic: SB3 flattens inputs.
-        x = observations.view(batch_size, self.stack_size, self.ram_size)
-        
-        # Project to Embedding
-        x = self.input_net(x) # (Batch, Stack, 512)
-        
-        # Add Position
-        x = self.pos_encoder(x)
-        
-        # Transformer Pass
-        x = self.transformer_encoder(x) # (Batch, Stack, 512)
-        
-        # Aggregation: Take the LAST vector (The most recent frame, enriched by history)
-        # The sequence is usually [Oldest ... Newest] 
-        # In our env implementation: append() adds to end. So -1 is newest.
-        features = x[:, -1, :] # (Batch, 512)
-        
-        return features
+        if rank < num_virtual:
+            env = VirtualBattleCityEnv(render_mode='rgb_array')
+            # SYNC REWARDS WITH REAL ENV TO PREVENT CHEATING
+            env.rew_explore = 0.01 
+        else:
+            env = BattleCityEnv(
+                render_mode='rgb_array',
+                stack_size=config.STACK_SIZE,
+                target_stage=getattr(config, 'TARGET_STAGE', None)
+            )
+            # HARDCORE MODE ENABLED BY DEFAULT
+            env.rew_kill = 2.0
+            env.rew_death = -2.0
+            env.rew_explore = 0.01
+            
+        env.reset(seed=seed + rank)
+        # Monitor with extra keywords (Added env_type)
+        return Monitor(env, info_keywords=('kills', 'exploration_pct', 'env_type'))
+    return _init
 
 def train():
     os.makedirs(config.MODEL_DIR, exist_ok=True)
     os.makedirs(config.LOG_DIR, exist_ok=True)
 
-    print(f"--- BATTLE CITY AI TRAINING (VISUAL MODE) ---")
+    print(f"--- BATTLE CITY TACTICAL TRAINING (RESNET ENHANCED) ---")
     
-    # Use SubprocVecEnv for Multicore Speed
-    # Windows Note: SubprocVecEnv requires non-lambda functions usually. 
-    # We use a list comprehension of factory functions.
-    
-    # Pass Config to Environment
-    env_kwargs = {'use_vision': config.USE_VISION, 'stack_size': config.STACK_SIZE}
-    
-    if config.NUM_CPU > 1:
-        # We need to import stable_baselines3.common.env_util to use make_vec_env with SubprocVecEnv correctly if not done automatically
-        env = make_vec_env(BattleCityEnv, n_envs=config.NUM_CPU, seed=42, vec_env_cls=SubprocVecEnv, env_kwargs=env_kwargs)
+    # Environment Setup
+    # Define monitor keywords for all modes
+    mon_kwargs = {'info_keywords': ('kills', 'exploration_pct', 'env_type')}
+
+    if getattr(config, 'USE_HYBRID', False):
+        num_virtual = getattr(config, 'NUM_VIRTUAL', config.NUM_CPU // 2)
+        print(f">> MODE: HYBRID (Virtual + Real)")
+        print(f"   Processes 0-{num_virtual - 1}: Virtual Map Learning")
+        print(f"   Processes {num_virtual}-{config.NUM_CPU - 1}: Real Combat")
+        
+        # Create list of env constructors manually
+        env_fns = [make_hybrid_env(i) for i in range(config.NUM_CPU)]
+        
+        if config.NUM_CPU > 1:
+            env = SubprocVecEnv(env_fns)
+        else:
+            env = DummyVecEnv(env_fns)
+            
+    elif getattr(config, 'USE_VIRTUAL', False):
+        print(">> MODE: VIRTUAL ONLY (Fast Simulation)")
+        EnvClass = VirtualBattleCityEnv
+        env_kwargs = {'render_mode': 'rgb_array'} 
+        if config.NUM_CPU > 1:
+            env = make_vec_env(EnvClass, n_envs=config.NUM_CPU, seed=42, vec_env_cls=SubprocVecEnv, env_kwargs=env_kwargs, monitor_kwargs=mon_kwargs)
+        else:
+            env = make_vec_env(EnvClass, n_envs=1, seed=42, vec_env_cls=DummyVecEnv, env_kwargs=env_kwargs, monitor_kwargs=mon_kwargs)
+            
     else:
-        env = make_vec_env(BattleCityEnv, n_envs=1, seed=42, vec_env_cls=DummyVecEnv, env_kwargs=env_kwargs)
+        print(">> MODE: REAL ONLY (NES Emulator)")
+        EnvClass = BattleCityEnv
+        env_kwargs = {
+            'render_mode': 'rgb_array',
+            'stack_size': config.STACK_SIZE,
+            'target_stage': getattr(config, 'TARGET_STAGE', None)
+        }
+        if config.NUM_CPU > 1:
+            env = make_vec_env(EnvClass, n_envs=config.NUM_CPU, seed=42, vec_env_cls=SubprocVecEnv, env_kwargs=env_kwargs, monitor_kwargs=mon_kwargs)
+        else:
+            env = make_vec_env(EnvClass, n_envs=1, seed=42, vec_env_cls=DummyVecEnv, env_kwargs=env_kwargs, monitor_kwargs=mon_kwargs)
 
-    # Apply VecNormalize (Stabilizes Training)
-    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    env = VecNormalize(env, norm_obs=False, norm_reward=True)
 
-    # Load or Create Model
-    # Choose Policy Type based on Config
-    policy_type = "MultiInputPolicy" if config.USE_VISION else "MlpPolicy"
-    
-    print(f"Stats: Vision={config.USE_VISION}, Stack={config.STACK_SIZE}, Policy={policy_type}")
-    # Auto-Resume Logic
-    latest_model_path = f"{config.MODEL_DIR}/battle_city_interrupted.zip"
-    final_model_path = f"{config.MODEL_DIR}/battle_city_final.zip"
-    
-    # Determine Learning Rate
-    if hasattr(config, 'LR_START'):
-        lr_schedule = linear_schedule(config.LR_START)
-        print(f"Using Linear LR Schedule starting at {config.LR_START}")
-    else:
-        lr_schedule = config.LEARNING_RATE
-        print(f"Using Constant Learning Rate: {config.LEARNING_RATE}")
-
-    # Select Model Class
-    if getattr(config, 'USE_RECURRENT', False) and RecurrentPPO is not None:
+    # 2. Setup Model
+    if config.USE_RECURRENT and RecurrentPPO is not None:
+        print("Using RecurrentPPO (LSTM)...")
         ModelClass = RecurrentPPO
-        print("Model Class: RecurrentPPO (LSTM)")
+        policy_type = "CnnLstmPolicy"
     else:
+        print("Using Standard PPO...")
         ModelClass = PPO
-        print("Model Class: Standard PPO")
+        policy_type = "CnnPolicy"
 
-    if os.path.exists(latest_model_path):
-        print(f"Loading interrupted model from {latest_model_path}...")
-        try:
-            model = ModelClass.load(latest_model_path, env=env)
-            model.learning_rate = lr_schedule # Update schedule
-            model.ent_coef = getattr(config, 'ENTROPY_COEF', getattr(config, 'ENT_COEF', 0.01))
-            model.clip_range = lambda _: config.CLIP_RANGE
-            reset_timesteps = False
-        except Exception as e:
-            print(f"Failed to load model architecture mismatch? Error: {e}")
-            print("Starting FRESH model due to incompatibility.")
-            model = None # Trigger creation logic
-            reset_timesteps = True
-            
-    elif os.path.exists(final_model_path):
-        print(f"Loading existing model from {final_model_path}...")
-        try:
-            model = ModelClass.load(final_model_path, env=env)
-            model.learning_rate = lr_schedule # Update schedule
-            model.ent_coef = getattr(config, 'ENTROPY_COEF', getattr(config, 'ENT_COEF', 0.01))
-            model.clip_range = lambda _: config.CLIP_RANGE
-            reset_timesteps = False
-        except Exception as e:
-             print(f"Failed to load model (mismatch?). Error: {e}")
-             model = None
-             reset_timesteps = True
-    else:
-        model = None
-        reset_timesteps = True
-
-    # --- TRANSFORMER ARCHITECTURE ---
-    # Moved to Global Scope
-
-
-    # --- MODEL CREATION ---
-    if model is None:
-        if getattr(config, 'USE_TRANSFORMER', False):
-            # HYBRID MODE: Tansformer + LSTM
-            if getattr(config, 'USE_RECURRENT', False): 
-                 print("Creating NEW MODEL (Hybrid: Transformer + RecurrentPPO)...")
-                 if RecurrentPPO is None:
-                     print("CRITICAL ERROR: sb3-contrib not installed. Cannot use LSTM.")
-                     return
-
-                 policy_kwargs = dict(
-                    features_extractor_class=TransformerFeatureExtractor,
-                    features_extractor_kwargs=dict(features_dim=512),
-                    net_arch=dict(pi=[512, 256], vf=[512, 256]), 
-                    activation_fn=th.nn.ReLU,
-                    lstm_hidden_size=512, # LSTM Layer size
-                    n_lstm_layers=1       # 1 Layer is enough for hybrid
-                 )
-                 
-                 # LSTM Policies
-                 if config.USE_VISION:
-                     lstm_policy_type = "MultiInputLstmPolicy"
-                 else:
-                     lstm_policy_type = "MlpLstmPolicy"
-                     
-                 model = RecurrentPPO(
-                    lstm_policy_type, 
-                    env, 
-                    verbose=1,
-                    tensorboard_log=config.LOG_DIR,
-                    learning_rate=lr_schedule,
-                    n_steps=config.N_STEPS,
-                    batch_size=config.BATCH_SIZE,
-                    n_epochs=getattr(config, 'N_EPOCHS', 10),
-                    ent_coef=getattr(config, 'ENTROPY_COEF', getattr(config, 'ENT_COEF', 0.01)),
-                    gamma=0.99,
-                    gae_lambda=0.95,
-                    clip_range=config.CLIP_RANGE,
-                    device="cuda",
-                    policy_kwargs=policy_kwargs 
-                 )
-
-            # STANDARD TRANSFORMER (No LSTM)
-            else:
-                 print(f"Creating NEW MODEL (Transformer PPO)... STACK_SIZE={config.STACK_SIZE}")
-                 policy_kwargs = dict(
-                    features_extractor_class=TransformerFeatureExtractor,
-                    features_extractor_kwargs=dict(features_dim=512),
-                    net_arch=dict(pi=[512, 256], vf=[512, 256]), 
-                    activation_fn=th.nn.ReLU,
-                 )
-    
-                 model = PPO(
-                    "MlpPolicy",
-                    env,
-                    verbose=1,
-                    tensorboard_log=config.LOG_DIR,
-                    learning_rate=lr_schedule, # Use the determined LR schedule
-                    n_steps=config.N_STEPS,
-                    batch_size=config.BATCH_SIZE,
-                    n_epochs=getattr(config, 'N_EPOCHS', 10),
-                    gamma=0.99,
-                    gae_lambda=0.95,
-                    clip_range=config.CLIP_RANGE,
-                    ent_coef=getattr(config, 'ENTROPY_COEF', getattr(config, 'ENT_COEF', 0.01)),
-                    policy_kwargs=policy_kwargs,
-                    device="cuda"
-                 )
-        else: # Original PPO/RecurrentPPO creation logic
-            # Define Network Architecture (Optimized for High-RAM Colab)
-            # OLD: [512, 256] -> Good.
-            # NEW: [1024, 512] -> Smarter. We have 15GB VRAM, let's use it.
-            
-            policy_kwargs = dict(
-                activation_fn=th.nn.ReLU,
-                net_arch=dict(pi=[1024, 512], vf=[1024, 512]),
-                lstm_hidden_size=1024, # <--- KEEP HUGE MEMORY
-                n_lstm_layers=2,       # <--- STABLE DEPTH (Gold Standard)
-                shared_lstm=False, 
-                enable_critic_lstm=True
-            )
-
-            # Check for RecurrentPPO (LSTM)
-            if getattr(config, 'USE_RECURRENT', False) and RecurrentPPO is not None:
-                 print("Creating NEW MODEL (RecurrentPPO / LSTM)...")
-                 # LSTM Policies
-                 if config.USE_VISION:
-                     lstm_policy_type = "MultiInputLstmPolicy"
-                 else:
-                     lstm_policy_type = "MlpLstmPolicy"
-                 
-                 model = RecurrentPPO(
-                    lstm_policy_type, 
-                    env, 
-                    verbose=1,
-                    tensorboard_log=config.LOG_DIR,
-                    learning_rate=lr_schedule,
-                    n_steps=config.N_STEPS,
-                    batch_size=config.BATCH_SIZE,
-                    n_epochs=getattr(config, 'N_EPOCHS', 10),
-                    ent_coef=getattr(config, 'ENTROPY_COEF', getattr(config, 'ENT_COEF', 0.01)),
-                    gamma=0.99,
-                    gae_lambda=0.95,
-                    clip_range=config.CLIP_RANGE,
-                    device="cuda",
-                    policy_kwargs=policy_kwargs 
-                 )
-            else:
-                 # Standard PPO
-                 print(f"Creating NEW MODEL ({policy_kwargs['net_arch']['pi'][0]}x{policy_kwargs['net_arch']['pi'][1]})...")
-                 model = PPO(
-                    policy_type, 
-                    env, 
-                    verbose=1,
-                    tensorboard_log=config.LOG_DIR,
-                    learning_rate=lr_schedule,
-                    n_steps=config.N_STEPS,          
-                    batch_size=config.BATCH_SIZE,       
-                    n_epochs=getattr(config, 'N_EPOCHS', 10),
-                    ent_coef=getattr(config, 'ENTROPY_COEF', getattr(config, 'ENT_COEF', 0.01)),
-                    gamma=0.99,
-                    gae_lambda=0.95,
-                    clip_range=config.CLIP_RANGE,
-                    device="cuda",
-                    policy_kwargs=policy_kwargs
-                 )
-        reset_timesteps = True
-
-    checkpoint_callback = CheckpointCallback(
-        save_freq=config.CHECKPOINT_FREQ,
-        save_path=config.MODEL_DIR,
-        name_prefix="battle_city_ppo"
+    # REDUCED CAPACITY TO FIT GPU MEMORY (512 instead of 1024)
+    policy_kwargs = dict(
+        features_extractor_class=CustomTacticalCNN,
+        features_extractor_kwargs=dict(features_dim=512), 
+        net_arch=dict(pi=[512, 512], vf=[512, 512]),   
+        activation_fn=torch.nn.ReLU,
     )
     
-    logger_callback = ConsoleLoggerCallback()
-    render_callback = RenderCallback()
+    # Check for saved models
+    final_path = f"{config.MODEL_DIR}/battle_city_final.zip"
+    interrupted_path = f"{config.MODEL_DIR}/battle_city_interrupted.zip"
+    
+    model = None
+    reset_timesteps = True
+    
+    # Attempt Load
+    load_path = interrupted_path if os.path.exists(interrupted_path) else (final_path if os.path.exists(final_path) else None)
+    
+    if load_path:
+        print(f"Loading model from {load_path}...")
+        try:
+            model = ModelClass.load(load_path, env=env)
+            # Update LR schedule with new params
+            model.learning_rate = config.LR_START # Initial value
+            
+            # RecurrentPPO might have slightly different param names, but ent_coef is standard
+            model.ent_coef = getattr(config, 'ENT_COEF', 0.01)
+            model.batch_size = config.BATCH_SIZE
+            model.n_steps = config.N_STEPS
+            reset_timesteps = False
+            print("Model loaded successfully.")
+        except Exception as e:
+            print(f"Incompatible model found ({e}). Starting FRESH with new tactical input.")
+            if os.path.exists(load_path):
+                 os.rename(load_path, f"{load_path}.old")
+            model = None
+    
+    if model is None:
+        print(f"Creating NEW {ModelClass.__name__} Model...")
+        model = ModelClass(
+            policy_type,
+            env,
+            verbose=1,
+            tensorboard_log=config.LOG_DIR,
+            learning_rate=config.LR_START, # Constant init, callback will adjust
+            n_steps=config.N_STEPS,
+            batch_size=config.BATCH_SIZE,
+            n_epochs=getattr(config, 'N_EPOCHS', 10),
+            gamma=config.GAMMA,
+            gae_lambda=0.95,
+            clip_range=config.CLIP_RANGE,
+            ent_coef=getattr(config, 'ENT_COEF', 0.01),
+            policy_kwargs=policy_kwargs,
+            device="cuda" if torch.cuda.is_available() else "cpu"
+        )
 
-    print("Start VISUAL Learning... (Press Ctrl+C to stop)")
+    # 3. Train
+    callbacks = [
+        CheckpointCallback(save_freq=config.CHECKPOINT_FREQ, save_path=config.MODEL_DIR, name_prefix="ppo_resnet"),
+        ConsoleLoggerCallback(),
+        # CurriculumCallback REMOVED - Single Stage Training
+        RenderCallback(),
+        KLAdaptiveLRCallback(verbose=1)
+    ]
+
     try:
         model.learn(
-            total_timesteps=config.TOTAL_TIMESTEPS, 
-            callback=[checkpoint_callback, logger_callback, render_callback],
+            total_timesteps=config.TOTAL_TIMESTEPS,
+            callback=callbacks,
             progress_bar=True,
             reset_num_timesteps=reset_timesteps
         )
-        model.save(f"{config.MODEL_DIR}/battle_city_final")
-        print("Training Finished!")
-        
-    except BaseException as e:
-        if isinstance(e, KeyboardInterrupt):
-            print("\n[User] Stopped by Keyboard (Ctrl+C).")
-        else:
-            print(f"\n[CRITICAL] Training Interrupted/Crashed: {e}")
-            
-        print("Saving EMERGENCY model...")
-        print("Saving EMERGENCY model...")
-        model.save(f"{config.MODEL_DIR}/battle_city_interrupted")
-        print("Saved.")
-        print("Saved.")
-        
+        model.save(final_path)
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user.")
+        model.save(interrupted_path)
+        print("Saved emergency backup.")
     finally:
-        print("Closing environment...")
-        try:
-             env.close()
-        except (EOFError, BrokenPipeError, ConnectionResetError):
-             # These are normal during forced shutdown of subprocesses
-             pass
-        except Exception as e:
-             print(f"Cleanup Warnings: {e}")
+        env.close()
 
 if __name__ == "__main__":
     train()

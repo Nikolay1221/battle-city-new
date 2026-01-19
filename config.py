@@ -1,47 +1,55 @@
-# ==========================================
-#         BATTLE CITY AI CONFIG
-# ==========================================
-
 # --- SYSTEM & HARDWARE ---
-# Number of parallel environments. 
-# On Colab (2 cores), keep this around 8-16. 
-# On powerful PC (24 cores), go for 48-64.
 import multiprocessing
 import os
-# NUM_CPU = multiprocessing.cpu_count()
-NUM_CPU = 12 # Optimized for Colab A100 Instance
-HEADLESS_MODE = True 
+
+NUM_CPU = 8  # Используем все ядра для сбора опыта
+
+# --- HYBRID CONFIGURATION ---
+NUM_VIRTUAL = 2
+
+HEADLESS_MODE = False
 
 # --- TRAINING DURATION ---
-TOTAL_TIMESTEPS = 100_000_000 # Forever.
+TOTAL_TIMESTEPS = 700_000
 
-# --- STACK_SIZE    = 128    # <--- TRANSFORMER CONTEXT: 8.5 seconds of history (128 frames)
-FRAME_SKIP    = 4     
-USE_VISION    = False 
-ROM_PATH      = "BattleCity.nes"
+# --- OBSERVATION ---
+STACK_SIZE = 4
+FRAME_SKIP = 4
+ROM_PATH = "BattleCity_fixed.nes"
+TARGET_STAGE = 0
 
-USE_RECURRENT   = True     # <--- Enable LSTM (Global Context)
-USE_TRANSFORMER = True     # <--- Enable Transformer (Local Vision)
+USE_RECURRENT = True
+USE_TRANSFORMER = False
+
+# --- VIRTUAL TRAINING ---
+USE_VIRTUAL = False
+USE_HYBRID = True
 
 # --- SAVING ---
-CHECKPOINT_FREQ = 50_000 
+CHECKPOINT_FREQ = 2_000
 MODEL_DIR = "models"
 LOG_DIR = "logs"
 
-# --- PPO HYPERPARAMETERS ---
-LEARNING_RATE = 0.0003   
-N_STEPS       = 2048     # 32 envs * 2048 = 65k buffer per update
-BATCH_SIZE    = 4096     # Reduced from 32768 to prevent CUDA OOM
-N_EPOCHS      = 10      
-ENT_COEF      = 0.01     # Less entropy needed with high parallel noise
-GAMMA         = 0.99     
+# --- PPO HYPERPARAMETERS (КОНФИГ ДЛЯ ЧИСТОГО СТАРТА) ---
+# Adaptive Learning Rate Settings
+# Для старта с нуля 0.00005 - это слишком мало. Агент не поймет связи действий и наград.
+LR_START = 0.0003  # (3e-4) Золотой стандарт Карпатого. Идеально для старта.
+LR_MIN = 0.0001  # (1e-4) Если станет слишком сложно, он притормозит.
+LR_MAX = 0.0005  # (5e-4) Позволяем разгоняться, если пойдет хорошо.
+TARGET_KL = 0.015  # Цель: менять мозг на 1.5% за шаг.
 
-# --- SAFETY ---
-ALLOW_NEW_MODEL = True # If True, will restart from scratch if no model found. If False, CRASHES.
+# --- MEMORY TRICK (VRAM SAVER) ---
+# N_STEPS = 4096 критически важен для старта с нуля!
+# В начале агент делает рандом. Чем больше буфер, тем выше шанс,
+# что в рандоме попадется убийство врага, и сеть научится.
+N_STEPS = 4096  # Хранится в RAM (ОЗУ). Дает стабильность.
 
-# --- RESTORED COMPATIBILITY SETTINGS ---
-# Required by current train.py/env.py
-STACK_SIZE = 64
-USE_VISION = False # <--- OPTIMIZATION: RAM ONLY (The Matrix Mode). 5x Speedup.
-ROM_PATH = 'BattleCity_fixed.nes'
-CLIP_RANGE = 0.2
+BATCH_SIZE = 128  # Хранится в VRAM (Видеокарта 4GB).
+# Если вылетит ошибка, ставь 128, но 256 лучше.
+
+N_EPOCHS = 10  # Учимся усердно на каждом куске данных.
+ENT_COEF = 0.05  # Для старта с нуля оставляем 0.05!
+# Ему нужно много экспериментировать в начале.
+GAMMA = 0.99
+CLIP_RANGE = 0.2  # Даем свободу изменений.
+ALLOW_NEW_MODEL = True

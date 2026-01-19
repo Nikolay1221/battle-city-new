@@ -41,3 +41,7 @@ ENV/
 logs/
 models/
 *.nes
+*.npy
+/*.png
+!templates/**/*.png
+!textures/**/*.png

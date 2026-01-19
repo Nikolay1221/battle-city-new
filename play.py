@@ -3,243 +3,177 @@ import pygame
 import numpy as np
 import sys
 import os
+import pandas as pd
+from collections import deque
 
 # Ensure we can import battle_city_env
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from battle_city_env import BattleCityEnv
 
 def main():
-    print("Initializing Battle City...")
+    print("Initializing Battle City Visualizer...")
     
-    # Initialize Pygame
     pygame.init()
+    pygame.font.init()
+    font_mono = pygame.font.SysFont("Courier New", 14, bold=True)
+    font_ui = pygame.font.SysFont("Arial", 16, bold=True)
     
-    # Scale factor for visibility (NES is 256x240, 84x84 crop used in AI)
-    # The raw NESEnv renders full resolution usually (256x240).
-    # Let's check what env.render() returns. 
-    # BattleCityEnv.render() calls self.env.render(), which usually opens a window in nes-py.
-    # But we want to capture it or control it.
-    
-    # Actually, nes_py's render(mode='human') creates its own pyglet window.
-    # Mixing Pygame input with Pyglet window might be messy.
-    # BETTER APPROACH:
-    # Use env with render_mode='rgb_array' -> get frame -> blit to Pygame window.
-    
+    # Init Env
     env = BattleCityEnv(render_mode='rgb_array', use_vision=False)
     obs, info = env.reset()
     
-    # Get initial frame to determine size
-    frame = env.raw_env.screen.copy() # (240, 256, 3) usually for NES
+    frame = env.raw_env.screen.copy()
     h, w, c = frame.shape
     
     SCALE = 3
-    screen = pygame.display.set_mode((w * SCALE, h * SCALE))
-    pygame.display.set_caption("Battle City - Human Mode (Arrows + Z)")
+    SIDE_PANEL = 500
+    screen = pygame.display.set_mode((w * SCALE + SIDE_PANEL, h * SCALE))
+    pygame.display.set_caption("Battle City - Clean Tactical View")
     
     clock = pygame.time.Clock()
     running = True
-    
-    print("\n CONTROLS:")
-    print(" [Arrows] : Move")
-    print(" [Z]      : Fire")
-    print(" [Esc]    : Quit")
-    
-    action_map = {
-        # Keys to Action Index
-        # 0: NOOP
-        # 1: Up
-        # 2: Down
-        # 3: Left
-        # 4: Right
-        # 5: A (Fire)
-        # 6: Up+A
-        # 7: Down+A
-        # 8: Left+A
-        # 9: Right+A
-    }
-    
-    # Create Stats Window
-    import cv2
-    from collections import deque
-    
-    cv2.namedWindow("Reward Log", cv2.WINDOW_AUTOSIZE)
-    cv2.moveWindow("Reward Log", w * SCALE + 20, 50) # Position next to game
-    
-    # Init Font
-    frame_font = pygame.font.SysFont('Arial', 12, bold=True)
-    
-    msg_log = deque(maxlen=20)
-    total_score = 0.0
-    
-    curr_frame = 0
+
+    msg_log = deque(maxlen=10)
+
     while running:
-        curr_frame += 1
-        if curr_frame == 300:
-             pygame.image.save(screen, "debug_auto.png")
-             print("DEBUG: Auto-saved debug_auto.png")
-             
-        # 1. Handle Events
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
+            if event.type == pygame.QUIT: running = False
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    running = False
-                elif event.key == pygame.K_s:
-                    # Save Screenshot
-                    # surf is scaled, let's save the raw frame if possible or just the surf
-                    # We can save surf
-                    pygame.image.save(screen, "debug_game_screen.png")
-                    print("Saved debug_game_screen.png")
+                if event.key == pygame.K_ESCAPE: running = False
         
-        # 2. Get Input State
+        # Input
         keys = pygame.key.get_pressed()
+        action = 0
         
-        up    = keys[pygame.K_UP]
-        down  = keys[pygame.K_DOWN]
-        left  = keys[pygame.K_LEFT]
-        right = keys[pygame.K_RIGHT]
-        fire  = keys[pygame.K_z]
+        # Menu
+        raw_action = 0
+        if keys[pygame.K_RETURN]: raw_action |= 0x08
+        if keys[pygame.K_TAB]:    raw_action |= 0x04
         
-        # Determine Action
-        action = 0 # NOOP
-        
-        if up:
-            if fire: action = 6
-            else:    action = 1
-        elif down:
-            if fire: action = 7
-            else:    action = 2
-        elif left:
-            if fire: action = 8
-            else:    action = 3
-        elif right:
-            if fire: action = 9
-            else:    action = 4
-        elif fire:
-            action = 5
-        
-        # 3. Step Env
-        obs, reward, terminated, truncated, info = env.step(action)
-        
-        # --- REWARD LOGGING ---
-        if abs(reward) > 0.001:
-            total_score += reward
-            # Identify Event
-            event_text = f"{reward:+.2f}"
-            color = (255, 255, 255) # White
+        if raw_action > 0:
+            obs, reward, terminated, truncated, info = env.raw_env.step(raw_action)
+        else:
+            up, down = keys[pygame.K_UP], keys[pygame.K_DOWN]
+            left, right = keys[pygame.K_LEFT], keys[pygame.K_RIGHT]
+            fire = keys[pygame.K_z]
             
-            if reward >= 1.0: 
-                event_text = f"KILL! ({reward:+.1f})"
-                color = (0, 255, 0) # Green
-            elif reward == 0.5:
-                event_text = f"BONUS ({reward:+.1f})"
-                color = (0, 255, 255) # Yellow
-            elif reward == 0.02:
-                event_text = f"Explore ({reward:+.2f})"
-                color = (200, 200, 200) # Grey
-            elif reward <= -1.0:
-                event_text = f"DIED ({reward:+.1f})"
-                color = (0, 0, 255) # Red
-            elif reward == -0.02:
-                event_text = f"Idle ({reward:+.2f})"
-                color = (0, 0, 100) # Dark Red
-            
-            msg_log.append((event_text, color))
-            
-        # Draw Stats Window
-        stats_bg = np.zeros((400, 300, 3), dtype=np.uint8)
-        
-        # Header
-        cv2.putText(stats_bg, f"Score: {total_score:.2f}", (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-                   
-        # Distance Info
-        dist = info.get('closest_enemy_dist', 999)
-        num_enemies = info.get('enemies_detected', 0)
-        
-        dist_color = (255, 255, 255)
-        if dist < 50: dist_color = (0, 0, 255) # Red (Danger!)
-        elif dist < 100: dist_color = (0, 255, 255) # Yellow
-        
-        cv2.putText(stats_bg, f"Enemies: {num_enemies}", (10, 60), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-        cv2.putText(stats_bg, f"Dist: {dist:.1f}", (150, 60), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, dist_color, 1)
-        
-        # Log
-        y = 90
-        for text, col in reversed(msg_log):
-            # Convert RGB (Pygame/Logical) to BGR (OpenCV)
-            bgr = (col[2], col[1], col[0])
-            cv2.putText(stats_bg, text, (10, y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 1)
-            y += 25
-            
-        cv2.imshow("Reward Log", stats_bg)
-        cv2.waitKey(1)
-        
-        # 4. Render Game
-        # Get raw screen from env (full res)
-        frame = env.raw_env.screen # RGB numpy array
-        
-        # Convert to Pygame Surface
+            if up:
+                if fire: action = 6
+                else:    action = 1
+            elif down:
+                if fire: action = 7
+                else:    action = 2
+            elif left:
+                if fire: action = 8
+                else:    action = 3
+            elif right:
+                if fire: action = 9
+                else:    action = 4
+            elif fire:
+                action = 5
+                
+            obs, reward, terminated, truncated, info = env.step(action)
+
+        if terminated or truncated:
+            msg_log.append(f"EPISODE END (Score: {info.get('score', 0):.1f})")
+            env.reset()
+
+        # Render Game
+        frame = env.raw_env.screen
         surf = pygame.surfarray.make_surface(frame.swapaxes(0,1))
-        
-        # Scale
         surf = pygame.transform.scale(surf, (w * SCALE, h * SCALE))
-        
-        # Blit
         screen.blit(surf, (0, 0))
         
-        # --- DEBUG OVERLAY ---
-        # Draw Player (RAM - Blue Box)
-        if 'player_cv' in info:
-           px_c, py_c = info['player_cv']
-           # Centroid to Top-Left
-           px = int((px_c - 8) * SCALE)
-           py = int((py_c - 8) * SCALE)
-           
-           pygame.draw.rect(screen, (0, 0, 255), (px, py, 16*SCALE, 16*SCALE), 2)
-           
-           lbl = frame_font.render("PLAYER", True, (0, 255, 255)) # Cyan text
-           screen.blit(lbl, (px, py - 15))
-            
-        # Draw Enemies (Red Box + ID)
-        if 'enemy_positions' in info:
-            for enemy_data in info['enemy_positions']:
-                # Unpack 5 elements
-                ex, ey, tmpl_id, score, is_visible = enemy_data
-                
-                ex_s = int((ex - 8) * SCALE)
-                ey_s = int((ey - 8) * SCALE)
-                
-                # Draw Box (Red)
-                pygame.draw.rect(screen, (255, 0, 0), (ex_s, ey_s, 16*SCALE, 16*SCALE), 2)
-                
-                # Draw LoS Line (Green=Clear, Red=Blocked)
-                if 'player_cv' in info:
-                    line_color = (0, 255, 0) if is_visible else (255, 50, 50)
-                    thickness = 2 if is_visible else 1
-                    pygame.draw.line(screen, line_color, (px + 8*SCALE, py + 8*SCALE), (ex_s + 8*SCALE, ey_s + 8*SCALE), thickness)
+        # Render Side Panel Background
+        pygame.draw.rect(screen, (30, 30, 30), (w*SCALE, 0, SIDE_PANEL, h*SCALE))
+        x_start = w*SCALE + 20
+        y_pos = 20
+        
+        # --- TACTICAL MAP ---
+        screen.blit(font_ui.render("TACTICAL MAP (26x26)", True, (255, 255, 255)), (x_start, y_pos))
+        y_pos += 30
+        
+        tactical_rgb = env.get_tactical_rgb()
+        cell_size = 12
+        map_surf = pygame.surfarray.make_surface(tactical_rgb.swapaxes(0,1))
+        map_surf = pygame.transform.scale(map_surf, (26 * cell_size, 26 * cell_size))
+        
+        screen.blit(map_surf, (x_start, y_pos))
+        
+        # Grid Lines
+        for i in range(27):
+            pygame.draw.line(screen, (50, 50, 50),
+                             (x_start, y_pos + i * cell_size),
+                             (x_start + 26 * cell_size, y_pos + i * cell_size))
+            pygame.draw.line(screen, (50, 50, 50),
+                             (x_start + i * cell_size, y_pos),
+                             (x_start + i * cell_size, y_pos + 26 * cell_size))
 
-                if tmpl_id != -1:
-                    status = "YES" if is_visible else "NO"
-                    lbl = frame_font.render(f"RAM {tmpl_id} | LoS: {status}", True, (255, 255, 0))
-                    screen.blit(lbl, (ex_s, ey_s - 15))
-                
-        pygame.display.flip()
+        y_pos += 26 * cell_size + 20
         
-        # 5. Cap FPS
-        clock.tick(60)
+        # --- RAM INSPECTOR ---
+        ram = env.raw_env.ram
         
-        if terminated or truncated:
-            msg_log.append(("--- EPISODE END ---", (100, 100, 255)))
-            env.reset()
+        screen.blit(font_ui.render("RAM INSPECTOR:", True, (255, 255, 0)), (x_start, y_pos))
+        y_pos += 25
+        
+        # 1. Player
+        px, py = ram[0x90], ram[0x98]
+        p_dir = ram[0x99] # Direction
+        screen.blit(font_mono.render(f"PLAYER: XY({px:03d},{py:03d}) DIR({p_dir})", True, (200, 255, 200)), (x_start, y_pos))
+        y_pos += 20
+        
+        # 2. Base
+        base_tile = ram[0x07D3]
+        if base_tile == 0x0C:
+            base_txt = "BASE: OK (0x0C)"
+            base_col = (0, 255, 0)
+        else:
+            base_txt = f"BASE: DESTROYED (0x{base_tile:02X})"
+            base_col = (255, 0, 0)
+        screen.blit(font_mono.render(base_txt, True, base_col), (x_start, y_pos))
+        y_pos += 20
+        
+        # 3. Enemies
+        screen.blit(font_mono.render("ENEMIES (HP | X, Y):", True, (200, 200, 200)), (x_start, y_pos))
+        y_pos += 20
+        
+        active_enemies = 0
+        for i in range(1, 5):
+            hp = ram[0x60 + i]
+            ex, ey = ram[0x90 + i], ram[0x98 + i]
             
+            if hp > 0:
+                active_enemies += 1
+                txt = f"#{i}: HP={hp} | {ex:03d}, {ey:03d}"
+                col = (255, 100, 100)
+            else:
+                txt = f"#{i}: DEAD"
+                col = (80, 80, 80)
+                
+            screen.blit(font_mono.render(txt, True, col), (x_start, y_pos))
+            y_pos += 18
+            
+        y_pos += 10
+        
+        # --- STATS ---
+        lives = ram[0x51]
+        kills = sum([ram[0x73+i] for i in range(4)])
+        stage = ram[0x85]
+        
+        screen.blit(font_ui.render(f"LIVES: {lives} | KILLS: {kills} | STAGE: {stage}", True, (255, 255, 255)), (x_start, y_pos))
+        y_pos += 30
+        
+        # --- LOG ---
+        for msg in list(msg_log)[-5:]:
+            screen.blit(font_mono.render(msg, True, (150, 150, 150)), (x_start, y_pos))
+            y_pos += 20
+
+        pygame.display.flip()
+        clock.tick(60)
+
     env.close()
     pygame.quit()
-    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
