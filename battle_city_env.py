@@ -63,7 +63,7 @@ class BattleCityEnv(gym.Env):
             "empty": 0,
             "brick": 200,   
             "steel": 255,   
-            "eagle": 255,   
+            "eagle": 254,   # SYNCED WITH VIRTUAL ENV (Was 255)
             "player": 150,  
             "enemy": 80,    
             "bullet": 255   

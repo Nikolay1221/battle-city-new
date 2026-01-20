@@ -1,179 +1,115 @@
 import gymnasium as gym
-import pygame
-import numpy as np
-import sys
 import os
-import pandas as pd
-from collections import deque
-
-# Ensure we can import battle_city_env
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import time
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from battle_city_env import BattleCityEnv
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+import config
 
-def main():
-    print("Initializing Battle City Visualizer...")
+# --- RESNET ARCHITECTURE (MUST MATCH TRAIN.PY) ---
+class ResBlock(nn.Module):
+    def __init__(self, n_channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(n_channels, n_channels, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(n_channels, n_channels, kernel_size=3, padding=1)
+        )
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.relu(x + self.conv(x))
+
+class CustomTacticalCNN(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 512):
+        super().__init__(observation_space, features_dim)
+        n_input_channels = observation_space.shape[0] 
+        
+        self.initial_conv = nn.Sequential(
+            nn.Conv2d(n_input_channels, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1), 
+            nn.ReLU(),
+        )
+        
+        self.res_blocks = nn.Sequential(
+            ResBlock(128),
+            ResBlock(128),
+            ResBlock(128)
+        )
+        
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1), 
+            nn.ReLU(),
+            nn.Conv2d(256, 256, kernel_size=3, stride=2, padding=1), 
+            nn.ReLU(),
+            nn.Flatten()
+        )
+
+        with torch.no_grad():
+            sample = torch.as_tensor(observation_space.sample()[None]).float()
+            x = self.initial_conv(sample)
+            x = self.res_blocks(x)
+            n_flatten = self.final_conv(x).shape[1]
+
+        self.linear = nn.Sequential(nn.Linear(n_flatten, features_dim), nn.ReLU())
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        x = self.initial_conv(observations)
+        x = self.res_blocks(x)
+        x = self.final_conv(x)
+        return self.linear(x)
+
+def play():
+    final_path = f"{config.MODEL_DIR}/battle_city_resnet_v1.zip"
+    interrupted_path = f"{config.MODEL_DIR}/battle_city_resnet_v1_interrupted.zip"
     
-    pygame.init()
-    pygame.font.init()
-    font_mono = pygame.font.SysFont("Courier New", 14, bold=True)
-    font_ui = pygame.font.SysFont("Arial", 16, bold=True)
+    model_path = None
+    if os.path.exists(interrupted_path):
+        model_path = interrupted_path
+    elif os.path.exists(final_path):
+        model_path = final_path
+        
+    if model_path is None:
+        print(f"Model not found! Looked for:\n1. {interrupted_path}\n2. {final_path}")
+        print("Run train.py first!")
+        return
+
+    print(f"Loading model: {model_path}")
     
-    # Init Env
-    env = BattleCityEnv(render_mode='rgb_array', use_vision=False)
-    obs, info = env.reset()
+    # Create REAL Environment
+    env = BattleCityEnv(render_mode='human', stack_size=config.STACK_SIZE)
+    env = DummyVecEnv([lambda: env])
+    env = VecNormalize(env, norm_obs=False, norm_reward=False, training=False)
+
+    try:
+        model = PPO.load(model_path, env=env)
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return
+
+    print("Starting Game...")
+    obs = env.reset()
     
-    frame = env.raw_env.screen.copy()
-    h, w, c = frame.shape
-    
-    SCALE = 3
-    SIDE_PANEL = 500
-    screen = pygame.display.set_mode((w * SCALE + SIDE_PANEL, h * SCALE))
-    pygame.display.set_caption("Battle City - Clean Tactical View")
-    
-    clock = pygame.time.Clock()
-    running = True
-
-    msg_log = deque(maxlen=10)
-
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT: running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE: running = False
+    total_reward = 0
+    while True:
+        # DETERMINISTIC MODE ON: Best actions only
+        action, _states = model.predict(obs, deterministic=True) 
+        obs, reward, done, info = env.step(action)
+        total_reward += reward
         
-        # Input
-        keys = pygame.key.get_pressed()
-        action = 0
+        env.render()
+        time.sleep(0.02)
         
-        # Menu
-        raw_action = 0
-        if keys[pygame.K_RETURN]: raw_action |= 0x08
-        if keys[pygame.K_TAB]:    raw_action |= 0x04
-        
-        if raw_action > 0:
-            obs, reward, terminated, truncated, info = env.raw_env.step(raw_action)
-        else:
-            up, down = keys[pygame.K_UP], keys[pygame.K_DOWN]
-            left, right = keys[pygame.K_LEFT], keys[pygame.K_RIGHT]
-            fire = keys[pygame.K_z]
-            
-            if up:
-                if fire: action = 6
-                else:    action = 1
-            elif down:
-                if fire: action = 7
-                else:    action = 2
-            elif left:
-                if fire: action = 8
-                else:    action = 3
-            elif right:
-                if fire: action = 9
-                else:    action = 4
-            elif fire:
-                action = 5
-                
-            obs, reward, terminated, truncated, info = env.step(action)
-
-        if terminated or truncated:
-            msg_log.append(f"EPISODE END (Score: {info.get('score', 0):.1f})")
-            env.reset()
-
-        # Render Game
-        frame = env.raw_env.screen
-        surf = pygame.surfarray.make_surface(frame.swapaxes(0,1))
-        surf = pygame.transform.scale(surf, (w * SCALE, h * SCALE))
-        screen.blit(surf, (0, 0))
-        
-        # Render Side Panel Background
-        pygame.draw.rect(screen, (30, 30, 30), (w*SCALE, 0, SIDE_PANEL, h*SCALE))
-        x_start = w*SCALE + 20
-        y_pos = 20
-        
-        # --- TACTICAL MAP ---
-        screen.blit(font_ui.render("TACTICAL MAP (26x26)", True, (255, 255, 255)), (x_start, y_pos))
-        y_pos += 30
-        
-        tactical_rgb = env.get_tactical_rgb()
-        cell_size = 12
-        map_surf = pygame.surfarray.make_surface(tactical_rgb.swapaxes(0,1))
-        map_surf = pygame.transform.scale(map_surf, (26 * cell_size, 26 * cell_size))
-        
-        screen.blit(map_surf, (x_start, y_pos))
-        
-        # Grid Lines
-        for i in range(27):
-            pygame.draw.line(screen, (50, 50, 50),
-                             (x_start, y_pos + i * cell_size),
-                             (x_start + 26 * cell_size, y_pos + i * cell_size))
-            pygame.draw.line(screen, (50, 50, 50),
-                             (x_start + i * cell_size, y_pos),
-                             (x_start + i * cell_size, y_pos + 26 * cell_size))
-
-        y_pos += 26 * cell_size + 20
-        
-        # --- RAM INSPECTOR ---
-        ram = env.raw_env.ram
-        
-        screen.blit(font_ui.render("RAM INSPECTOR:", True, (255, 255, 0)), (x_start, y_pos))
-        y_pos += 25
-        
-        # 1. Player
-        px, py = ram[0x90], ram[0x98]
-        p_dir = ram[0x99] # Direction
-        screen.blit(font_mono.render(f"PLAYER: XY({px:03d},{py:03d}) DIR({p_dir})", True, (200, 255, 200)), (x_start, y_pos))
-        y_pos += 20
-        
-        # 2. Base
-        base_tile = ram[0x07D3]
-        if base_tile == 0x0C:
-            base_txt = "BASE: OK (0x0C)"
-            base_col = (0, 255, 0)
-        else:
-            base_txt = f"BASE: DESTROYED (0x{base_tile:02X})"
-            base_col = (255, 0, 0)
-        screen.blit(font_mono.render(base_txt, True, base_col), (x_start, y_pos))
-        y_pos += 20
-        
-        # 3. Enemies
-        screen.blit(font_mono.render("ENEMIES (HP | X, Y):", True, (200, 200, 200)), (x_start, y_pos))
-        y_pos += 20
-        
-        active_enemies = 0
-        for i in range(1, 5):
-            hp = ram[0x60 + i]
-            ex, ey = ram[0x90 + i], ram[0x98 + i]
-            
-            if hp > 0:
-                active_enemies += 1
-                txt = f"#{i}: HP={hp} | {ex:03d}, {ey:03d}"
-                col = (255, 100, 100)
-            else:
-                txt = f"#{i}: DEAD"
-                col = (80, 80, 80)
-                
-            screen.blit(font_mono.render(txt, True, col), (x_start, y_pos))
-            y_pos += 18
-            
-        y_pos += 10
-        
-        # --- STATS ---
-        lives = ram[0x51]
-        kills = sum([ram[0x73+i] for i in range(4)])
-        stage = ram[0x85]
-        
-        screen.blit(font_ui.render(f"LIVES: {lives} | KILLS: {kills} | STAGE: {stage}", True, (255, 255, 255)), (x_start, y_pos))
-        y_pos += 30
-        
-        # --- LOG ---
-        for msg in list(msg_log)[-5:]:
-            screen.blit(font_mono.render(msg, True, (150, 150, 150)), (x_start, y_pos))
-            y_pos += 20
-
-        pygame.display.flip()
-        clock.tick(60)
-
-    env.close()
-    pygame.quit()
+        if done:
+            print(f"Game Over. Total Reward: {total_reward}")
+            obs = env.reset()
+            total_reward = 0
 
 if __name__ == "__main__":
-    main()
+    play()

@@ -1,55 +1,46 @@
 # --- SYSTEM & HARDWARE ---
 import multiprocessing
 import os
-
-NUM_CPU = 8  # Используем все ядра для сбора опыта
+# Reduced from 24 to 16 to save VRAM
+NUM_CPU = 16 
 
 # --- HYBRID CONFIGURATION ---
-NUM_VIRTUAL = 2
+NUM_VIRTUAL = 16 # ALL VIRTUAL
 
-HEADLESS_MODE = False
+HEADLESS_MODE = False 
 
 # --- TRAINING DURATION ---
-TOTAL_TIMESTEPS = 700_000
+TOTAL_TIMESTEPS = 10_000_000 
 
 # --- OBSERVATION ---
-STACK_SIZE = 4
-FRAME_SKIP = 4
+STACK_SIZE = 4 
+FRAME_SKIP = 4 
 ROM_PATH = "BattleCity_fixed.nes"
-TARGET_STAGE = 0
+TARGET_STAGE = 0 
 
-USE_RECURRENT = True
+USE_RECURRENT = False 
 USE_TRANSFORMER = False
 
 # --- VIRTUAL TRAINING ---
-USE_VIRTUAL = False
-USE_HYBRID = True
+USE_VIRTUAL = True  
+USE_HYBRID  = False 
 
 # --- SAVING ---
-CHECKPOINT_FREQ = 2_000
+CHECKPOINT_FREQ = 100_000 
 MODEL_DIR = "models"
 LOG_DIR = "logs"
 
-# --- PPO HYPERPARAMETERS (КОНФИГ ДЛЯ ЧИСТОГО СТАРТА) ---
-# Adaptive Learning Rate Settings
-# Для старта с нуля 0.00005 - это слишком мало. Агент не поймет связи действий и наград.
-LR_START = 0.0003  # (3e-4) Золотой стандарт Карпатого. Идеально для старта.
-LR_MIN = 0.0001  # (1e-4) Если станет слишком сложно, он притормозит.
-LR_MAX = 0.0005  # (5e-4) Позволяем разгоняться, если пойдет хорошо.
-TARGET_KL = 0.015  # Цель: менять мозг на 1.5% за шаг.
+# --- PPO HYPERPARAMETERS ---
+LR_START      = 0.0005  # Increased to learn shooting faster
+LR_MIN        = 0.00001
+LR_MAX        = 0.001 
+TARGET_KL     = 0.03 
 
-# --- MEMORY TRICK (VRAM SAVER) ---
-# N_STEPS = 4096 критически важен для старта с нуля!
-# В начале агент делает рандом. Чем больше буфер, тем выше шанс,
-# что в рандоме попадется убийство врага, и сеть научится.
-N_STEPS = 4096  # Хранится в RAM (ОЗУ). Дает стабильность.
-
-BATCH_SIZE = 128  # Хранится в VRAM (Видеокарта 4GB).
-# Если вылетит ошибка, ставь 128, но 256 лучше.
-
-N_EPOCHS = 10  # Учимся усердно на каждом куске данных.
-ENT_COEF = 0.05  # Для старта с нуля оставляем 0.05!
-# Ему нужно много экспериментировать в начале.
-GAMMA = 0.99
-CLIP_RANGE = 0.2  # Даем свободу изменений.
+# Adjusted for Stability
+N_STEPS       = 1024    
+BATCH_SIZE    = 512     
+N_EPOCHS      = 4       
+ENT_COEF      = 0.05    # Increased entropy to encourage shooting (random actions)
+GAMMA         = 0.99     
+CLIP_RANGE    = 0.2
 ALLOW_NEW_MODEL = True

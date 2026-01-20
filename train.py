@@ -174,8 +174,12 @@ class RenderCallback(BaseCallback):
             # Calculate Grid Dimensions
             n_envs = len(grid_images)
             
-            # Force 4 columns layout for better fit
-            cols = 4
+            # Dynamic layout based on number of envs
+            if n_envs <= 4: cols = 2
+            elif n_envs <= 8: cols = 4
+            elif n_envs <= 16: cols = 4
+            else: cols = 6 # For 24 envs -> 6x4 grid
+            
             rows = int(np.ceil(n_envs / cols))
             
             # Fill empty slots
@@ -193,9 +197,13 @@ class RenderCallback(BaseCallback):
             # Vertical stack
             full_grid = np.vstack(final_rows)
 
-            # Resize for visibility (Scale x6 for 52px -> 312px blocks)
-            # Increased to x6 for better visibility
+            # Dynamic Scale
+            # 52px base size.
+            # If we have many rows, we need smaller scale to fit screen.
             scale = 6
+            if rows > 2: scale = 4
+            if rows > 4: scale = 3 # For 24 envs (4 rows of 6 cols) -> 52*4*3 = 624px height. Perfect.
+            
             h, w = full_grid.shape[:2]
             
             # Convert RGB to BGR for OpenCV
@@ -211,24 +219,11 @@ class RenderCallback(BaseCallback):
                 y = i * 52 * scale
                 cv2.line(display_grid, (0, y), (w*scale, y), (255, 255, 255), 2)
 
-            # Add internal cell grid (subtle) - every 4 cells (16 pixels)
-            for i in range(w // 52 * 52 + 1):
-                x = i * scale
-                if x % (52 * scale) != 0:
-                    # Draw grid every 4 cells (to mimic 16x16 blocks)
-                    if i % 4 == 0:
-                        cv2.line(display_grid, (x, 0), (x, h*scale), (40, 40, 40), 1)
-            for i in range(h // 52 * 52 + 1):
-                y = i * scale
-                if y % (52 * scale) != 0:
-                    if i % 4 == 0:
-                        cv2.line(display_grid, (0, y), (w*scale, y), (40, 40, 40), 1)
-
             if not self.windows_initialized:
-                cv2.namedWindow("BATTLE CITY - 8 PARALLEL WORLDS", cv2.WINDOW_AUTOSIZE)
+                cv2.namedWindow("BATTLE CITY - MASSIVE PARALLEL", cv2.WINDOW_AUTOSIZE)
                 self.windows_initialized = True
 
-            cv2.imshow("BATTLE CITY - 8 PARALLEL WORLDS", display_grid)
+            cv2.imshow("BATTLE CITY - MASSIVE PARALLEL", display_grid)
             cv2.waitKey(1)
 
         except Exception as e:
@@ -397,8 +392,9 @@ def train():
     )
     
     # Check for saved models
-    final_path = f"{config.MODEL_DIR}/battle_city_final.zip"
-    interrupted_path = f"{config.MODEL_DIR}/battle_city_interrupted.zip"
+    # CHANGED FILENAME TO AVOID CONFLICT WITH OLD LSTM MODEL
+    final_path = f"{config.MODEL_DIR}/battle_city_resnet_v1.zip"
+    interrupted_path = f"{config.MODEL_DIR}/battle_city_resnet_v1_interrupted.zip"
     
     model = None
     reset_timesteps = True

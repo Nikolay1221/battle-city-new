@@ -19,8 +19,7 @@ TILES = {
     0:  {"name": "Empty", "color": (0, 0, 0)},
     25: {"name": "Brick", "color": (160, 60, 0)},
     50: {"name": "Steel", "color": (180, 180, 180)},
-    75: {"name": "Eagle", "color": (0, 255, 255)},
-    # Future proofing (not used in env yet but good for editor)
+    75: {"name": "Eagle (Base)", "color": (255, 0, 255)}, # Magenta for visibility
     100: {"name": "Water", "color": (0, 0, 255)}, 
     125: {"name": "Forest", "color": (0, 100, 0)},
 }
@@ -108,6 +107,14 @@ def main():
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_s:
                     save_map(grid)
+                elif event.key == pygame.K_e: # Hotkey for Eagle
+                    selected_tile = 75
+                elif event.key == pygame.K_b: # Hotkey for Brick
+                    selected_tile = 25
+                elif event.key == pygame.K_x: # Hotkey for Steel
+                    selected_tile = 50
+                elif event.key == pygame.K_SPACE: # Hotkey for Eraser
+                    selected_tile = 0
 
         # Drawing
         screen.fill(COLOR_BG)
@@ -144,6 +151,12 @@ def main():
         pygame.draw.rect(screen, (0, 150, 0), save_btn_rect)
         save_lbl = font.render("SAVE MAP (S)", True, COLOR_TEXT)
         screen.blit(save_lbl, (save_btn_rect.x + 30, save_btn_rect.y + 10))
+        
+        # Cursor Preview
+        mx, my = pygame.mouse.get_pos()
+        if mx < GRID_SIZE * CELL_SIZE:
+            preview_color = TILES[selected_tile]["color"]
+            pygame.draw.circle(screen, preview_color, (mx, my), 5)
 
         pygame.display.flip()
         clock.tick(60)
