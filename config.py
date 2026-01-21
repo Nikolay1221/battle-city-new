@@ -10,7 +10,7 @@ NUM_VIRTUAL = 2
 HEADLESS_MODE = False
 
 # --- TRAINING DURATION ---
-TOTAL_TIMESTEPS = 1_400_000
+TOTAL_TIMESTEPS = 6_000_000
 
 # --- OBSERVATION ---
 STACK_SIZE = 4
@@ -21,38 +21,56 @@ TARGET_STAGE = 0
 USE_RECURRENT = False
 USE_TRANSFORMER = False
 
-# --- REWARDS ---
+# --- GLOBAL DEFAULT REWARDS ---
 REW_KILL = 1.0
 REW_DEATH = -1.0
 REW_BASE = -20.0
 REW_EXPLORE = 0.01
 REW_WIN = 20.0
 
+# --- REWARD PROFILES ---
+# Allows different environments to incentivize different behaviors
+REWARD_VARIANTS = {
+    "DEFAULT": {
+        # Balanced: Map control (0.03 * 400 cells = 12 pts) is roughly equal to ~12 Kills.
+        # Encourages moving out of base.
+        "kill": 1.0, "death": -1.0, "base": -20.0, "explore": 0.01, "win": 20.0
+    },
+    "EXPLORER": {
+        "kill": 0.1, "death": -0.5, "base": -5.0, "explore": 0.05, "win": 10.0 # Focus on map coverage
+    },
+    "SURVIVOR": {
+        "kill": 1.0, "death": -5.0, "base": -30.0, "explore": 0.0, "win": 50.0 # Do not die!
+    },
+    "AGGRESSIVE": {
+        "kill": 1.0, "death": -1.0, "base": -20.0, "explore": 0.1, "win": 20.0 # Kill everything
+    }
+}
+
 # --- TRAINING MODES ---
 # Define presets for environment variants
+# Added 'reward_profile' key
 ENV_VARIANTS = {
-    "STANDARD":        {"enemy_count": 20, "no_shooting": False},
-    "PEACEFUL":        {"enemy_count": 0,  "no_shooting": True},
-    "TARGET_PRACTICE": {"enemy_count": 0,  "no_shooting": False}, # Walls only
-    "VERY_EASY":       {"enemy_count": 2,  "no_shooting": False}, # Requested: 2 enemies
-    "LIGHT_COMBAT":    {"enemy_count": 5,  "no_shooting": False},
-    "MEDIUM_COMBAT":   {"enemy_count": 10, "no_shooting": False},
+    "STANDARD":        {"enemy_count": 20, "no_shooting": False, "reward_profile": "DEFAULT"},
+    "PEACEFUL":        {"enemy_count": 0,  "no_shooting": True,  "reward_profile": "EXPLORER"}, # Focus on moving
+    "TARGET_PRACTICE": {"enemy_count": 0,  "no_shooting": False, "reward_profile": "DEFAULT"},
+    "VERY_EASY":       {"enemy_count": 2,  "no_shooting": False, "reward_profile": "AGGRESSIVE"}, # Learn to kill!
+    "LIGHT_COMBAT":    {"enemy_count": 5,  "no_shooting": False, "reward_profile": "DEFAULT"},
+    # --- FULL COMBAT PROFILES (Standard Spawning, Different Goals) ---
+    "PROFILE_AGGRESSIVE": {"enemy_count": 20, "no_shooting": False, "reward_profile": "AGGRESSIVE"}, # Kill everything
+    "PROFILE_EXPLORER":   {"enemy_count": 20, "no_shooting": False, "reward_profile": "EXPLORER"},   # Focus on map
+    "PROFILE_SURVIVOR":   {"enemy_count": 20, "no_shooting": False, "reward_profile": "SURVIVOR"},   # Focus on survival
+    
     "VIRTUAL":         "VIRTUAL" 
 }
 
 TRAIN_MODE = "HYBRID"
 
-# Hybrid Distribution (Sum must be 8)
-# Curriculum-style distribution:
+# Hybrid Distribution (Sum must be 16)
+# Multi-Objective Training:
 HYBRID_CONFIG = {
-    "PEACEFUL": 1,          # #1: Just walking
-    "TARGET_PRACTICE": 1,   # #2: Shooting walls
-    "VERY_EASY": 1,         # #3: 2 Enemies
-    "LIGHT_COMBAT": 1,      # #4: 5 Enemies
-    "MEDIUM_COMBAT": 1,     # #5: 10 Enemies
-    "STANDARD": 3           # #6-8: Full War (20 Enemies)
+    "STANDARD": 8,  # #1-4: Killer Squad
 }
-
 # --- OBSOLETE FLAGS ---
 USE_VIRTUAL = False
 USE_HYBRID = False

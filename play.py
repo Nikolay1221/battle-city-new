@@ -8,6 +8,7 @@ from collections import deque
 
 # Ensure we can import battle_city_env
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import config
 from battle_city_env import BattleCityEnv
 
 def main():
@@ -18,9 +19,34 @@ def main():
     font_mono = pygame.font.SysFont("Courier New", 14, bold=True)
     font_ui = pygame.font.SysFont("Arial", 16, bold=True)
     
-    # Init Env
-    # DEBUG: Force enemy_count=2 to verify logic
-    env = BattleCityEnv(render_mode='rgb_array', use_vision=False, enemy_count=2)
+    # Init Env with Modes
+    modes = list(config.ENV_VARIANTS.keys())
+    # Filter out VIRTUAL for play.py
+    modes = [m for m in modes if m != "VIRTUAL"]
+    current_mode_idx = 0
+    
+    def make_env_for_mode(mode_name):
+        variant = config.ENV_VARIANTS[mode_name]
+        reward_profile = variant.get("reward_profile", "DEFAULT")
+        reward_config = config.REWARD_VARIANTS.get(reward_profile, None)
+        
+        print(f"Switching to Mode: {mode_name}")
+        print(f" - Enemies: {variant.get('enemy_count')}")
+        print(f" - Profile: {reward_profile}")
+        
+        return BattleCityEnv(
+            render_mode='rgb_array', 
+            use_vision=False, 
+            enemy_count=variant.get("enemy_count", 20),
+            no_shooting=variant.get("no_shooting", False),
+            reward_config=reward_config,
+            exploration_trigger=variant.get("exploration_trigger", None)
+        )
+
+    # Initial Start (Default to PROFILE_EXPLORER if available, else STANDARD)
+    start_mode = "PROFILE_EXPLORER" if "PROFILE_EXPLORER" in modes else "STANDARD"
+    current_mode_idx = modes.index(start_mode)
+    env = make_env_for_mode(start_mode)
     obs, info = env.reset()
     
     frame = env.raw_env.screen.copy()
@@ -34,43 +60,31 @@ def main():
     clock = pygame.time.Clock()
     running = True
 
-    msg_log = deque(maxlen=10)
+    msg_log = deque(maxlen=50) # Increased history
+    popups = [] # List of [text, timer, color]
+    scroll_offset = 0 # For log scrolling
 
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT: running = False
+            elif event.type == pygame.MOUSEWHEEL:
+                scroll_offset += event.y # Scroll up/down
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE: running = False
+                elif event.key == pygame.K_m:
+                    # Switch Mode
+                    current_mode_idx = (current_mode_idx + 1) % len(modes)
+                    new_mode = modes[current_mode_idx]
+                    env.close()
+                    env = make_env_for_mode(new_mode)
+                    obs, info = env.reset()
+                    msg_log.append(f"SWITCHED MODE: {new_mode}")
                 elif event.key == pygame.K_k: 
                     print("CHEAT: Clearing Enemies!")
-                    env.cheat_clear_enemies()
+                    # env.cheat_clear_enemies() # Not implemented in base env yet
+                    pass 
                 elif event.key == pygame.K_j:
-                    # No longer exists, reused for something else?
                     pass
-        
-        # --- EXPERIMENTAL: FORCE 2 ENEMIES LOGIC ---
-        # 1. Stop spawning new enemies from reserve
-        # 0x80 = Enemies Lines Count (Values like 20, 19, 18...)
-        # If we set it to 0, the game stops generating NEW ones after current ones die.
-        # But we want to KEEP getting them, just max 2 on screen? 
-        # Actually, let's just keep clamping the on-screen slots.
-        
-        # 2. Teleport Excess Enemies (Slots 3, 4, 5, 6)
-        TARGET_COUNT = 2
-        ram = env.raw_env.ram
-        
-        # Clamp reserve so we don't play forever? 
-        # Let's try keeping reserve high (so they keep spawning) but only allow 2 slots.
-        # If we teleport slots 3 & 4 to 0,0, they might get "stuck" occupying the slot?
-        # Let's test.
-        
-        for i in range(TARGET_COUNT + 1, 7): # Slots 3 to 6
-             if 0x90 + i < 0x100:
-                 env.raw_env.ram[0x90 + i] = 0 # X
-                 env.raw_env.ram[0x98 + i] = 0 # Y
-                 # Also maybe stun them?
-                 
-        # -------------------------------------------
         
         # Input
         keys = pygame.key.get_pressed()
@@ -142,6 +156,45 @@ def main():
 
         y_pos += 26 * cell_size + 20
         
+        # --- REWARD POPUPS MANAGER ---
+        events = info.get('reward_events', [])
+        if events:
+            for e in events:
+                msg_log.append(f">>> {e} <<<")
+                # Add to visual popups: [Text, Timer(frames), Color]
+                col = (255, 255, 0) # Default Yellow
+                if "DEFENDER" in e: col = (100, 255, 100) # Green for Defense
+                if "MILESTONE" in e: col = (255, 100, 255) # Purple for Milestones
+                popups.append([e, 120, col]) # 2 Seconds (60fps * 2)
+
+        # Draw Popups (Kill Feed Style - Top Left, Stacking Down)
+        # Filter dead ones
+        popups = [[txt, t-1, c] for txt, t, c in popups if t > 0]
+        
+        # Show max 5 recent popups
+        visible_popups = popups[-5:] 
+        
+        for i, (txt, t, c) in enumerate(visible_popups):
+            # i=0 is the oldest valid, i=4 is newest
+            # Let's stack them downwards: Oldest at top? Or Newest at top?
+            # Standard kill feed: Newest at bottom usually, or Newest at top.
+            # Let's put Newest at Bottom of the list (which is index -1).
+            
+            label = font_ui.render(txt, True, c)
+            # Text Outline
+            outline = font_ui.render(txt, True, (0,0,0))
+            
+            # Position: Top Left
+            p_x = 10
+            p_y = 10 + (i * 25) # Stack downwards
+            
+            # Simple background box for readability
+            bg_rect = pygame.Rect(p_x - 2, p_y - 2, label.get_width() + 4, label.get_height() + 4)
+            pygame.draw.rect(screen, (0, 0, 0, 180), bg_rect) # Semi-transparent black? Pygame rect doesn't support alpha directly without surface. Just black for now.
+            
+            screen.blit(label, (p_x, p_y))
+
+        
         # --- RAM INSPECTOR ---
         ram = env.raw_env.ram
         
@@ -194,7 +247,7 @@ def main():
         y_pos += 20
         
         active_enemies = 0
-        for i in range(1, 5):
+        for i in range(1, 7):
             hp = ram[0x60 + i]
             ex, ey = ram[0x90 + i], ram[0x98 + i]
             
@@ -216,11 +269,58 @@ def main():
         kills = sum([ram[0x73+i] for i in range(4)])
         stage = ram[0x85]
         
-        screen.blit(font_ui.render(f"LIVES: {lives} | KILLS: {kills} | STAGE: {stage}", True, (255, 255, 255)), (x_start, y_pos))
+        screen.blit(font_ui.render(f"LIVES: {lives} | KILLS: {kills} | STAGE: {stage} | MODE: {modes[current_mode_idx]}", True, (255, 255, 255)), (x_start, y_pos))
         y_pos += 30
         
-        # --- LOG ---
-        for msg in list(msg_log)[-5:]:
+        # --- EXPLORATION PROGRESS ---
+        explore_pct = info.get('exploration_pct', 0.0)
+        trigger_pct = info.get('trigger_pct', 0.0)
+        
+        # Draw Bar
+        bar_w = 200
+        bar_h = 15
+        pygame.draw.rect(screen, (50, 50, 50), (x_start, y_pos, bar_w, bar_h))
+        pygame.draw.rect(screen, (0, 100, 255), (x_start, y_pos, int(bar_w * explore_pct), bar_h))
+        
+        # Draw Trigger Marker
+        if trigger_pct > 0:
+             trig_x = x_start + int(bar_w * trigger_pct)
+             pygame.draw.line(screen, (255, 0, 0), (trig_x, y_pos - 5), (trig_x, y_pos + bar_h + 5), 2)
+             msg = f"EXPLORE: {explore_pct*100:.1f}% (Trig: {trigger_pct*100:.0f}%)"
+        else:
+             msg = f"EXPLORE: {explore_pct*100:.1f}%"
+             
+        screen.blit(font_mono.render(msg, True, (200, 200, 255)), (x_start + bar_w + 10, y_pos))
+        y_pos += 30
+        
+        # --- SCROLLABLE LOG ---
+        # Show last 10 messages with scroll offset
+        log_list = list(msg_log)
+        # Apply scroll
+        # Scroll 0 = Show newest at bottom. 
+        # Scroll > 0 = Look back in history.
+        
+        max_visible = 10
+        total_logs = len(log_list)
+        
+        # Clamp scroll
+        max_scroll = max(0, total_logs - max_visible)
+        if scroll_offset > max_scroll: scroll_offset = max_scroll
+        if scroll_offset < 0: scroll_offset = 0
+        
+        # Determine slice
+        # If scroll is 0, we want indices [-10:]
+        # If scroll is 1, we want indices [-11:-1]
+        start_idx = total_logs - max_visible - scroll_offset
+        if start_idx < 0: start_idx = 0
+        end_idx = start_idx + max_visible
+        
+        visible_logs = log_list[start_idx:end_idx]
+        
+        screen.blit(font_ui.render(f"EVENT LOG ({scroll_offset}/{max_scroll}) [Wheel to Scroll]", True, (200, 200, 0)), (x_start, y_pos))
+        y_pos += 20
+
+        for msg in visible_logs:
             screen.blit(font_mono.render(msg, True, (150, 150, 150)), (x_start, y_pos))
             y_pos += 20
 

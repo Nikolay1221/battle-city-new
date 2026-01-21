@@ -324,12 +324,18 @@ def make_configured_env(rank, variant_name, seed=0):
         # Default fallback
         if isinstance(variant, str): variant = config.ENV_VARIANTS["STANDARD"]
 
+        # Reward Injection
+        reward_profile_name = variant.get("reward_profile", "DEFAULT")
+        reward_config = config.REWARD_VARIANTS.get(reward_profile_name, None)
+
         env = BattleCityEnv(
             render_mode='rgb_array',
             stack_size=config.STACK_SIZE,
             target_stage=getattr(config, 'TARGET_STAGE', None),
             enemy_count=variant.get("enemy_count", 20),
-            no_shooting=variant.get("no_shooting", False)
+            no_shooting=variant.get("no_shooting", False),
+            reward_config=reward_config,
+            exploration_trigger=variant.get("exploration_trigger", None)
         )
         env.reset(seed=seed + rank)
         

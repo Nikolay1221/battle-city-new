@@ -11,7 +11,7 @@ import config
 class BattleCityEnv(gym.Env):
     metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 60}
 
-    def __init__(self, rom_path=config.ROM_PATH, render_mode=None, use_vision=False, stack_size=4, target_stage=None, enemy_count=20, no_shooting=False):
+    def __init__(self, rom_path=config.ROM_PATH, render_mode=None, use_vision=False, stack_size=4, target_stage=None, enemy_count=20, no_shooting=False, reward_config=None, exploration_trigger=None):
         super().__init__()
         
         self.rom_path = rom_path
@@ -22,6 +22,12 @@ class BattleCityEnv(gym.Env):
         
         self.MAX_STEPS = 100_000_000 
         self.steps_in_episode = 0
+        
+        # New Mechanics
+        self.enemy_count = enemy_count
+        self.no_shooting = no_shooting
+        self.exploration_trigger = exploration_trigger 
+        self.ambush_triggered = False
         
         if not os.path.exists(self.rom_path):
             raise FileNotFoundError(f"ROM file not found at: {self.rom_path}")
@@ -73,14 +79,20 @@ class BattleCityEnv(gym.Env):
         self.frames = deque(maxlen=self.STACK_SIZE)
 
         # Rewards Configuration
-        # Rewards Configuration (From Config)
-        self.enemy_count = enemy_count
-        self.no_shooting = no_shooting
-        
-        self.rew_kill = getattr(config, 'REW_KILL', 1.0)
-        self.rew_death = getattr(config, 'REW_DEATH', -1.0)
-        self.rew_base = getattr(config, 'REW_BASE', -20.0)
-        self.rew_explore = getattr(config, 'REW_EXPLORE', 0.01)
+        # Rewards Configuration
+        # If reward_config is passed (from Multi-Env setup), use it. Else default to config.py defaults.
+        if reward_config:
+            self.rew_kill = reward_config.get('kill', 1.0)
+            self.rew_death = reward_config.get('death', -1.0)
+            self.rew_base = reward_config.get('base', -20.0)
+            self.rew_explore = reward_config.get('explore', 0.01)
+            self.rew_win = reward_config.get('win', 20.0)
+        else:
+            self.rew_kill = getattr(config, 'REW_KILL', 1.0)
+            self.rew_death = getattr(config, 'REW_DEATH', -1.0)
+            self.rew_base = getattr(config, 'REW_BASE', -20.0)
+            self.rew_explore = getattr(config, 'REW_EXPLORE', 0.01)
+            self.rew_win = getattr(config, 'REW_WIN', 50.0)
         
         # CONDITIONAL WIN REWARD
         # Only grant win reward if this is a "Full" game (20 enemies)
@@ -121,6 +133,19 @@ class BattleCityEnv(gym.Env):
         self.episode_kills = 0 
         self.level_cleared = False
         self.base_active_latch = False # NEW: Latch for base status
+        
+        # --- EXPERIMENTAL REWARDS ---
+        self.last_kill_step = -9999
+        self.kill_streak = 0
+        
+        # Base Coordinates (Approx, in 52x52 grid or higher? Use RAM)
+        # Base is at 120, 216 roughly. 
+        # In RAM coords (0x90, 0x98): X~120, Y~208-216?
+        # Let's use scalar distance.
+        self.BASE_X = 120
+        self.BASE_Y = 216
+        self.prev_enemies = [] # Track enemy state for defense logic
+
 
     def _get_tactical_map(self):
         """Creates a 52x52 GRAYSCALE matrix representing the game state (VISUAL ONLY)."""
@@ -189,6 +214,7 @@ class BattleCityEnv(gym.Env):
         self.episode_kills = 0
         self.level_cleared = False
         self.base_active_latch = False # Reset Latch
+        self.ambush_triggered = False # Reset ambush
         self.visited_sectors = set()
         self.frames.clear()
         
@@ -250,36 +276,95 @@ class BattleCityEnv(gym.Env):
                 terminated = True
                 break
         
-        # --- LIMIT ENEMIES ON SCREEN (HYBRID TELEPORT) ---
-        # If enemy_count is small (e.g. 0, 2, 5), we force excess slots to (0,0).
-        # We assume standard Battle City uses slots 1-6 max.
-        if self.enemy_count < 6:
-             for i in range(self.enemy_count + 1, 7):
-                 # Addresses: X = 0x90+i, Y = 0x98+i
-                 if 0x90 + i < 0x100: 
-                      self.raw_env.ram[0x90 + i] = 0
-                      self.raw_env.ram[0x98 + i] = 0
-             
-             # Special Case: If 0 enemies, we also prevent idle timeouts
-             if self.enemy_count == 0:
-                 self.idle_steps = 0 
+        # (Old Limit Logic Removed - Moved to End with Ambush)
         # -------------------------------------------------
         
         self.steps_in_episode += 1 
         ram = self.raw_env.ram
         reward = 0 
         
+        # 0. State Tracking for Rewards
+        current_enemies = []
+        for i in range(1, 7): # Slots 1-6
+            e_hp = int(ram[0x60 + i]) if 0x60 + i < 0x100 else 0
+            e_x  = int(ram[0x90 + i]) if 0x90 + i < 0x100 else 0
+            e_y  = int(ram[0x98 + i]) if 0x98 + i < 0x100 else 0
+            current_enemies.append({'hp': e_hp, 'x': e_x, 'y': e_y})
+
         # 1. Kill Rewards
         curr_kill_sum = sum([int(ram[addr]) for addr in self.ADDR_KILLS])
         diff = curr_kill_sum - self.prev_kill_sum
         
+        info['reward_events'] = [] # For visualization
+        
         if diff > 0:
             reward += self.rew_kill * diff
             self.episode_kills += diff
+            info['reward_events'].append(f"KILL (+{self.rew_kill})")
             
+            # --- KILL MILESTONES (VOLUME BONUS) ---
+            # ... (Milestone logic same as before) ...
+            
+            milestones = {
+                2: 1.0,  # "Double Kill" equivalent
+                5: 2.0,  # "Rampage"
+                8: 5.0   # "Dominating"
+            }
+            
+            if self.episode_kills in milestones:
+                bonus = milestones[self.episode_kills]
+                reward += bonus
+                info['reward_events'].append(f"KILL MILESTONE {self.episode_kills} (+{bonus})")
+
+            # --- BASE DEFENSE BONUS (Advanced) ---
+            # If we have history (not first step)
+            if hasattr(self, 'prev_enemies') and self.prev_enemies:
+                for i in range(6):
+                    prev = self.prev_enemies[i]
+                    curr = current_enemies[i]
+                    
+                    # Logic: Enemy WAS alive, NOW is dead (or respawning/gone)
+                    # Note: When dead, HP becomes 0.
+                    if prev['hp'] > 0 and curr['hp'] == 0:
+                        # This guy died. Was he a threat?
+                        dist = np.sqrt((prev['x'] - self.BASE_X)**2 + (prev['y'] - self.BASE_Y)**2)
+                        if dist < 60:
+                            reward += 0.5
+                            info['reward_events'].append("DEFENDER (+0.5)")
+            
+        # Update history unconditionally
+        self.prev_enemies = current_enemies
         self.prev_kill_sum = curr_kill_sum
         
+        # --- ANTI-HACK MEASURES (ROBUSTNESS) ---
+        
+        # 1. ABANDONMENT PENALTY
+        # If an enemy is threatening the base (dist < 50) AND player is far away (dist > 80),
+        # punish the player for not defending.
+        min_enemy_dist = 999.0
+        if current_enemies:
+            # Filter alive ones
+            alive_dists = [np.sqrt((e['x'] - self.BASE_X)**2 + (e['y'] - self.BASE_Y)**2) for e in current_enemies if e['hp'] > 0]
+            if alive_dists:
+                min_enemy_dist = min(alive_dists)
+        
+        p_x, p_y = int(ram[self.ADDR_X_ARR]), int(ram[self.ADDR_Y_ARR])
+        player_dist = np.sqrt((p_x - self.BASE_X)**2 + (p_y - self.BASE_Y)**2)
+        
+        if min_enemy_dist < 50 and player_dist > 80:
+             reward -= 0.05
+             # Don't spam log, maybe just once in a while or implicit
+        
+        # 2. IDLE / COWARDICE PENALTY
+        # If we are idling (no explore, no kills) for too long, we punish before reset.
+        if self.idle_steps > 3000:
+             truncated = True
+             reward -= 5.0 # "Boredom" penalty
+             info['game_over_reason'] = 'idle_timeout'
+             info['reward_events'].append("IDLE TIMEOUT (-5.0)")
+
         # CHECK FOR VICTORY
+        # ...
         curr_stage = int(ram[self.ADDR_STAGE])
         
         # Condition 1: Kills Limit (Only if full game)
@@ -314,6 +399,7 @@ class BattleCityEnv(gym.Env):
         if curr_lives < 10 and self.prev_lives < 10:
              if curr_lives < self.prev_lives:
                 reward += self.rew_death
+                info['reward_events'].append(f"DIED ({self.rew_death})")
         self.prev_lives = curr_lives
         
         # 3. Game Over Checks
@@ -327,7 +413,8 @@ class BattleCityEnv(gym.Env):
              terminated = True
              reward += self.rew_base
              info['game_over_reason'] = 'base_destroyed'
-        
+             info['reward_events'].append(f"BASE LOST ({self.rew_base})")
+
         # 4. EXPLORATION REWARD
         curr_x, curr_y = int(ram[self.ADDR_X_ARR]), int(ram[self.ADDR_Y_ARR])
         
@@ -336,13 +423,73 @@ class BattleCityEnv(gym.Env):
              if (sec_x, sec_y) not in self.visited_sectors:
                  reward += self.rew_explore
                  self.visited_sectors.add((sec_x, sec_y))
+                 info['reward_events'].append(f"EXPLORE (+{self.rew_explore})")
              self.idle_steps = 0
         else:
              if action != 0: 
                  reward += self.rew_stuck
              self.idle_steps += 1
         
-        info['exploration_pct'] = len(self.visited_sectors) / 169.0 * 100
+        # --- AMBUSH LOGIC & ENEMY CONTROL ---
+        
+        # 1. AMBUSH STATE MANAGEMENT
+        if self.exploration_trigger is not None:
+            explore_pct = len(self.visited_sectors) / 240.0
+            
+            if not self.ambush_triggered:
+                if explore_pct >= self.exploration_trigger:
+                    # --- TRIGGER ACTIVATED ---
+                    self.ambush_triggered = True
+                    info['reward_events'].append("AMBUSH STARTED! (ENEMIES ARRIVING)")
+                    
+                    # Teleport existing "held" enemies to battle positions
+                    # Spawn X Coords: 0, 128, 192 (Approximate standard spawns)
+                    spawn_x = [0, 128, 192]
+                    for i in range(1, 7):
+                        if ram[0x60 + i] > 0: # If alive (was held)
+                             target_x = spawn_x[(i-1) % 3]
+                             self.raw_env.ram[0x90 + i] = target_x # X
+                             self.raw_env.ram[0x98 + i] = 0        # Y (Top)
+                
+                else:
+                    # --- PRE-AMBUSH SUPPRESSION ---
+                    # Keep enemies alive but trapped/hidden at (0,0)
+                    for i in range(1, 7):
+                         # Slots 1-4 have HP. Slots 5-6 might be coords-only (stars/glitches).
+                         should_suppress = False
+                         
+                         if i <= 4:
+                             if ram[0x60 + i] > 0: should_suppress = True
+                         else:
+                             should_suppress = True # Unconditional for ghosts
+                             
+                         if should_suppress:
+                              self.raw_env.ram[0x90 + i] = 0
+                              self.raw_env.ram[0x98 + i] = 0
+        
+        # 2. STANDARD LIMIT (For non-Ambush limited modes like VERY_EASY)
+        # Only apply if we are NOT in pre-ambush suppression (since suppression handles it).
+        # OR if Ambush is active, we might still want to limit to 5 enemies?
+        # Yes, obey self.enemy_count.
+        
+        apply_standard_limit = True
+        if self.exploration_trigger is not None and not self.ambush_triggered:
+             apply_standard_limit = False # Suppression already handling it
+             
+        if apply_standard_limit and self.enemy_count < 6:
+             for i in range(self.enemy_count + 1, 7):
+                 if 0x90 + i < 0x100: 
+                      self.raw_env.ram[0x90 + i] = 0
+                      self.raw_env.ram[0x98 + i] = 0
+                      #Kill excess beyond limit (standard behavior)
+                      self.raw_env.ram[0x60 + i] = 0
+             
+             # Special Case: If 0 enemies, we also prevent idle timeouts
+             if self.enemy_count == 0:
+                 self.idle_steps = 0 
+        
+        info['exploration_pct'] = len(self.visited_sectors) / 240.0 # Corrected total
+        info['trigger_pct'] = self.exploration_trigger if self.exploration_trigger else 0.0
         info['nes_reward'] = nes_reward
         info['kills'] = self.episode_kills 
         # Env Type: 0 = Peaceful/Sim/Simplified, 1 = Full Standard Combat
