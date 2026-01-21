@@ -11,7 +11,7 @@ import config
 class BattleCityEnv(gym.Env):
     metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 60}
 
-    def __init__(self, rom_path=config.ROM_PATH, render_mode=None, use_vision=False, stack_size=4, target_stage=None, sandbox_mode=False):
+    def __init__(self, rom_path=config.ROM_PATH, render_mode=None, use_vision=False, stack_size=4, target_stage=None, enemy_count=20, no_shooting=False):
         super().__init__()
         
         self.rom_path = rom_path
@@ -74,11 +74,20 @@ class BattleCityEnv(gym.Env):
 
         # Rewards Configuration
         # Rewards Configuration (From Config)
+        self.enemy_count = enemy_count
+        self.no_shooting = no_shooting
+        
         self.rew_kill = getattr(config, 'REW_KILL', 1.0)
         self.rew_death = getattr(config, 'REW_DEATH', -1.0)
         self.rew_base = getattr(config, 'REW_BASE', -20.0)
         self.rew_explore = getattr(config, 'REW_EXPLORE', 0.01)
-        self.rew_win = getattr(config, 'REW_WIN', 50.0)
+        
+        # CONDITIONAL WIN REWARD
+        # Only grant win reward if this is a "Full" game (20 enemies)
+        if self.enemy_count >= 20:
+             self.rew_win = getattr(config, 'REW_WIN', 50.0)
+        else:
+             self.rew_win = 0.0 # No reward for clearing a partial/empty level
         
         self.rew_stuck = -0.001 
         self.rew_brick = 0.0 
@@ -108,7 +117,7 @@ class BattleCityEnv(gym.Env):
         self.prev_y = 0
         self.idle_steps = 0
         self.visited_sectors = set()
-        self.sandbox_mode = sandbox_mode 
+        
         self.episode_kills = 0 
         self.level_cleared = False
         self.base_active_latch = False # NEW: Latch for base status
@@ -183,10 +192,6 @@ class BattleCityEnv(gym.Env):
         self.visited_sectors = set()
         self.frames.clear()
         
-        # Reset Sandbox if needed, or keep it persistent? 
-        # User might want to toggle it live. Let's keep self.sandbox_mode as is.
-        # But we need to apply it immediately if active.
-        
         # Start Sequence
         for _ in range(80): self.raw_env.step(0)
         for _ in range(10): self.raw_env.step(8)
@@ -195,6 +200,16 @@ class BattleCityEnv(gym.Env):
         for _ in range(30): self.raw_env.step(0)
         for _ in range(10): self.raw_env.step(8)
         for _ in range(60): self.raw_env.step(0)
+
+        # --- CUSTOM ENEMY COUNT RAM HACK ---
+        if 0 < self.enemy_count < 20:
+            # Note: 0x80 is "Enemies Remaining to Spawn". 
+            # The game starts with 20. If we set it to (N-2), it will spawn roughly N.
+            # (Because 2-3 are usually already on screen or pending).
+            # This is an approximation.
+            target = max(0, self.enemy_count - 3) 
+            self.raw_env.ram[self.ADDR_ENEMIES_LEFT] = target
+            # Also clear any on screen if we want very few? No, let them spawn.
 
         # Init state
         self.prev_lives = int(self.raw_env.ram[self.ADDR_LIVES])
@@ -220,11 +235,9 @@ class BattleCityEnv(gym.Env):
         ram = self.raw_env.ram
         old_x, old_y = int(ram[self.ADDR_X_ARR]), int(ram[self.ADDR_Y_ARR])
 
-        # --- SANDBOX MODE: Disable shooting ---
-        if self.sandbox_mode:
+        # --- MODE: No Shooting ---
+        if self.no_shooting:
             # Remap fire actions to movement only
-            # 5 (Fire) -> 0 (NOOP)
-            # 6-9 (Move+Fire) -> 1-4 (Move)
             if action == 5:
                 action = 0
             elif action >= 6 and action <= 9:
@@ -237,19 +250,20 @@ class BattleCityEnv(gym.Env):
                 terminated = True
                 break
         
-        # --- SANDBOX MODE (EMPTY MAP) ---
-        if self.sandbox_mode:
-            # Force all enemy slots to (0,0) to effectively remove them from the map
-            # without breaking the game's internal logic/timers.
-            # Covers indices 1-6 (Addresses 0x91-0x96 for X, 0x99-0x9E for Y)
-            for i in range(1, 7):
-                if 0x90 + i < 0x100: 
-                     self.raw_env.ram[0x90 + i] = 0 # X
-                     self.raw_env.ram[0x98 + i] = 0 # Y
-            
-            # Prevent idle timeouts since nothing is happening
-            self.idle_steps = 0 
-        # -------------------------
+        # --- LIMIT ENEMIES ON SCREEN (HYBRID TELEPORT) ---
+        # If enemy_count is small (e.g. 0, 2, 5), we force excess slots to (0,0).
+        # We assume standard Battle City uses slots 1-6 max.
+        if self.enemy_count < 6:
+             for i in range(self.enemy_count + 1, 7):
+                 # Addresses: X = 0x90+i, Y = 0x98+i
+                 if 0x90 + i < 0x100: 
+                      self.raw_env.ram[0x90 + i] = 0
+                      self.raw_env.ram[0x98 + i] = 0
+             
+             # Special Case: If 0 enemies, we also prevent idle timeouts
+             if self.enemy_count == 0:
+                 self.idle_steps = 0 
+        # -------------------------------------------------
         
         self.steps_in_episode += 1 
         ram = self.raw_env.ram
@@ -265,27 +279,32 @@ class BattleCityEnv(gym.Env):
             
         self.prev_kill_sum = curr_kill_sum
         
-        # CHECK FOR VICTORY (20 Kills OR Stage Change)
+        # CHECK FOR VICTORY
         curr_stage = int(ram[self.ADDR_STAGE])
         
-        # Win Condition 1: 20 Kills (Standard)
-        if self.episode_kills >= 20 and not self.level_cleared:
-            reward += self.rew_win
-            self.level_cleared = True
-            terminated = True 
-            info['is_success'] = True
-            info['win_reason'] = 'kills_limit'
+        # Condition 1: Kills Limit (Only if full game)
+        # If enemy_count < 20, we don't grant win for killing all (because there aren't 20)
+        # unless we explicitly want to logic that out. 
+        # Currently requested: "REW_WIN = 20.0 начислять не будем" if < 20.
+        if self.enemy_count >= 20: 
+            if self.episode_kills >= 20 and not self.level_cleared:
+                reward += self.rew_win
+                self.level_cleared = True
+                terminated = True 
+                info['is_success'] = True
+                info['win_reason'] = 'kills_limit'
 
-        # Win Condition 2: Stage Changed (Ram 0x85)
-        # Means the game logic decided the level is done (e.g. all enemies dead)
+        # Condition 2: Stage Changed
+        # This means the internal game logic is happy (all enemies dead).
         if curr_stage != self.prev_stage:
-             if not self.level_cleared:
+             # Only grant the BIG reward if it was a full game
+             if not self.level_cleared and self.enemy_count >= 20:
                  reward += self.rew_win
                  self.level_cleared = True
-                 terminated = True
                  info['is_success'] = True
                  info['win_reason'] = 'stage_cleared'
-             # If we already cleared it (e.g. by kills), we just ensure termination
+             
+             # Terminate regardless
              terminated = True
              
         self.prev_stage = curr_stage
@@ -298,33 +317,17 @@ class BattleCityEnv(gym.Env):
         self.prev_lives = curr_lives
         
         # 3. Game Over Checks
-        
-        # A. Lives Check (0x51)
-        # Если жизней 0 - игра окончена
         if curr_lives == 0:
             terminated = True
             info['game_over_reason'] = 'no_lives'
 
-        # B. Base Status Check (0x68 Latch)
-        # 0 -> 80 (Active) -> 0 (Destroyed)
         base_status = int(ram[self.ADDR_BASE_STATUS])
-        
-        # Latch arming: If we see a non-zero value, the base is active
-        if base_status != 0:
-             self.base_active_latch = True
-             
-        # Latch triggering: If verified active (latch=True) and now 0 -> Destroyed
+        if base_status != 0: self.base_active_latch = True
         if self.base_active_latch and base_status == 0:
              terminated = True
              reward += self.rew_base
              info['game_over_reason'] = 'base_destroyed'
         
-        # Fallback/Legacy State Check (optional, kept for safety vs Glitches)
-        curr_state = int(ram[self.ADDR_STATE])
-        if curr_state == 0xE0: # Game Over Screen state
-             terminated = True
-             # info['game_over_reason'] = 'state_E0' # Optional debug
-
         # 4. EXPLORATION REWARD
         curr_x, curr_y = int(ram[self.ADDR_X_ARR]), int(ram[self.ADDR_Y_ARR])
         
@@ -342,8 +345,8 @@ class BattleCityEnv(gym.Env):
         info['exploration_pct'] = len(self.visited_sectors) / 169.0 * 100
         info['nes_reward'] = nes_reward
         info['kills'] = self.episode_kills 
-        # Env Type: 0 = Sandbox (Virtual-like), 1 = Real Combat
-        info['env_type'] = 0 if self.sandbox_mode else 1 
+        # Env Type: 0 = Peaceful/Sim/Simplified, 1 = Full Standard Combat
+        info['env_type'] = 1 if (self.enemy_count >= 20 and not self.no_shooting) else 0
 
 
         self.prev_x, self.prev_y = curr_x, curr_y
@@ -368,14 +371,9 @@ class BattleCityEnv(gym.Env):
         self.raw_env.ram[self.ADDR_ENEMIES_LEFT] = 0
         # 2. Reset on-screen counter
         self.raw_env.ram[self.ADDR_ENEMIES_ON_SCREEN] = 0
-        # 3. Optional: Zero out enemy HPs to force them to die immediately if the counter isn't enough
+        # 3. Optional: Zero out enemy HPs 
         for i in range(1, 5):
             self.raw_env.ram[0x60 + i] = 0
             
-    def toggle_sandbox_mode(self):
-        self.sandbox_mode = not self.sandbox_mode
-        print(f"SANDBOX MODE: {self.sandbox_mode}")
-        return self.sandbox_mode
-
     def close(self):
         self.env.close()

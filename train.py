@@ -22,7 +22,7 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 from battle_city_env import BattleCityEnv
 from battle_city_env import BattleCityEnv
-# from virtual_env import VirtualBattleCityEnv # No longer used
+# from simulation_env import SimulationBattleCityEnv  # Moved locally to avoid ImportError
 import config 
 
 # --- CALLBACKS ---
@@ -301,37 +301,41 @@ class CustomTacticalCNN(BaseFeaturesExtractor):
         x = self.final_conv(x)
         return self.linear(x)
 
-def make_hybrid_env(rank, seed=0):
+def make_configured_env(rank, variant_name, seed=0):
     """
-    Factory function for hybrid environment creation.
-    Rank 0 to NUM_VIRTUAL-1: Virtual Env (Map Learning)
-    Rank NUM_VIRTUAL to NUM_CPU-1: Real Env (Combat)
+    Factory function for specific environment configuration using ENV_VARIANTS.
     """
     def _init():
-        # Use config.NUM_VIRTUAL to decide split
-        num_virtual = getattr(config, 'NUM_VIRTUAL', config.NUM_CPU // 2)
+        variant = config.ENV_VARIANTS.get(variant_name, config.ENV_VARIANTS["STANDARD"])
         
-        if rank < num_virtual:
-            # SANDBOX MODE ('Virtual' Learning using Real Env)
-            env = BattleCityEnv(
-                render_mode='rgb_array',
-                stack_size=config.STACK_SIZE,
-                target_stage=getattr(config, 'TARGET_STAGE', None),
-                sandbox_mode=True # ENABLE SANDBOX for Map Learning
-            )
-        else:
-            env = BattleCityEnv(
-                render_mode='rgb_array',
-                stack_size=config.STACK_SIZE,
-                target_stage=getattr(config, 'TARGET_STAGE', None),
-                sandbox_mode=False # REAL COMBAT
-            )
+        # 1. Virtual Environment
+        if variant == "VIRTUAL":
+            try:
+                from simulation_env import SimulationBattleCityEnv
+            except ImportError:
+                 raise ImportError("Virtual Environment not found.")
             
-        # Unified rewards are now handled in BattleCityEnv via config.py
-        # No manual overrides needed here.
-            
+            env = SimulationBattleCityEnv(render_mode='rgb_array')
+            env = Monitor(env, info_keywords=('kills', 'exploration_pct', 'env_type'))
+            return env
+
+        # 2. Real NES Environment
+        # Extract kwargs from variant dict
+        # Default fallback
+        if isinstance(variant, str): variant = config.ENV_VARIANTS["STANDARD"]
+
+        env = BattleCityEnv(
+            render_mode='rgb_array',
+            stack_size=config.STACK_SIZE,
+            target_stage=getattr(config, 'TARGET_STAGE', None),
+            enemy_count=variant.get("enemy_count", 20),
+            no_shooting=variant.get("no_shooting", False)
+        )
         env.reset(seed=seed + rank)
-        # Monitor with extra keywords (Added env_type)
+        
+        # Monitor
+        # Env Type: 0 = Training/Partial, 1 = Full Combat
+        is_full_combat = (env.enemy_count >= 20 and not env.no_shooting)
         return Monitor(env, info_keywords=('kills', 'exploration_pct', 'env_type'))
     return _init
 
@@ -342,44 +346,39 @@ def train():
     print(f"--- BATTLE CITY TACTICAL TRAINING (RESNET ENHANCED) ---")
     
     # Environment Setup
-    # Define monitor keywords for all modes
-    mon_kwargs = {'info_keywords': ('kills', 'exploration_pct', 'env_type')}
-
-    if getattr(config, 'USE_HYBRID', False):
-        num_virtual = getattr(config, 'NUM_VIRTUAL', config.NUM_CPU // 2)
-        print(f">> MODE: HYBRID (Real Sandbox + Real Combat)")
-        print(f"   Processes 0-{num_virtual - 1}: Sandbox Map Learning (Real Env, No Enemies)")
-        print(f"   Processes {num_virtual}-{config.NUM_CPU - 1}: Real Combat")
+    train_mode = getattr(config, 'TRAIN_MODE', 'STANDARD')
+    print(f">> TRAIN MODE: {train_mode}")
+    
+    env_fns = []
+    
+    if train_mode == "HYBRID":
+        # Parse HYBRID_CONFIG
+        hybrid_conf = getattr(config, 'HYBRID_CONFIG', {"STANDARD": config.NUM_CPU})
         
-        # Create list of env constructors manually
-        env_fns = [make_hybrid_env(i) for i in range(config.NUM_CPU)]
-        
-        if config.NUM_CPU > 1:
-            env = SubprocVecEnv(env_fns)
-        else:
-            env = DummyVecEnv(env_fns)
-            
-    elif getattr(config, 'USE_VIRTUAL', False):
-        print(">> MODE: VIRTUAL ONLY (Fast Simulation)")
-        EnvClass = VirtualBattleCityEnv
-        env_kwargs = {'render_mode': 'rgb_array'} 
-        if config.NUM_CPU > 1:
-            env = make_vec_env(EnvClass, n_envs=config.NUM_CPU, seed=42, vec_env_cls=SubprocVecEnv, env_kwargs=env_kwargs, monitor_kwargs=mon_kwargs)
-        else:
-            env = make_vec_env(EnvClass, n_envs=1, seed=42, vec_env_cls=DummyVecEnv, env_kwargs=env_kwargs, monitor_kwargs=mon_kwargs)
-            
+        current_idx = 0
+        # Iterate config keys
+        for mode_name, count in hybrid_conf.items():
+            print(f"   - {count} envs: {mode_name}")
+            for _ in range(count):
+                if current_idx >= config.NUM_CPU: break
+                env_fns.append(make_configured_env(current_idx, mode_name))
+                current_idx += 1
+                
+        if len(env_fns) != config.NUM_CPU:
+            print(f"WARNING: Hybrid config count ({len(env_fns)}) != NUM_CPU ({config.NUM_CPU}). Filling rest with STANDARD.")
+            while len(env_fns) < config.NUM_CPU:
+                env_fns.append(make_configured_env(len(env_fns), "STANDARD"))
+                
     else:
-        print(">> MODE: REAL ONLY (NES Emulator)")
-        EnvClass = BattleCityEnv
-        env_kwargs = {
-            'render_mode': 'rgb_array',
-            'stack_size': config.STACK_SIZE,
-            'target_stage': getattr(config, 'TARGET_STAGE', None)
-        }
-        if config.NUM_CPU > 1:
-            env = make_vec_env(EnvClass, n_envs=config.NUM_CPU, seed=42, vec_env_cls=SubprocVecEnv, env_kwargs=env_kwargs, monitor_kwargs=mon_kwargs)
-        else:
-            env = make_vec_env(EnvClass, n_envs=1, seed=42, vec_env_cls=DummyVecEnv, env_kwargs=env_kwargs, monitor_kwargs=mon_kwargs)
+        # Uniform Mode
+        print(f"   - All {config.NUM_CPU} envs: {train_mode}")
+        for i in range(config.NUM_CPU):
+            env_fns.append(make_configured_env(i, train_mode))
+
+    if config.NUM_CPU > 1:
+        env = SubprocVecEnv(env_fns)
+    else:
+        env = DummyVecEnv(env_fns)
 
     env = VecNormalize(env, norm_obs=False, norm_reward=True)
 

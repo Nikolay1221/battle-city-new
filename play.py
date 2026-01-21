@@ -19,7 +19,8 @@ def main():
     font_ui = pygame.font.SysFont("Arial", 16, bold=True)
     
     # Init Env
-    env = BattleCityEnv(render_mode='rgb_array', use_vision=False)
+    # DEBUG: Force enemy_count=2 to verify logic
+    env = BattleCityEnv(render_mode='rgb_array', use_vision=False, enemy_count=2)
     obs, info = env.reset()
     
     frame = env.raw_env.screen.copy()
@@ -44,7 +45,32 @@ def main():
                     print("CHEAT: Clearing Enemies!")
                     env.cheat_clear_enemies()
                 elif event.key == pygame.K_j:
-                    env.toggle_sandbox_mode()
+                    # No longer exists, reused for something else?
+                    pass
+        
+        # --- EXPERIMENTAL: FORCE 2 ENEMIES LOGIC ---
+        # 1. Stop spawning new enemies from reserve
+        # 0x80 = Enemies Lines Count (Values like 20, 19, 18...)
+        # If we set it to 0, the game stops generating NEW ones after current ones die.
+        # But we want to KEEP getting them, just max 2 on screen? 
+        # Actually, let's just keep clamping the on-screen slots.
+        
+        # 2. Teleport Excess Enemies (Slots 3, 4, 5, 6)
+        TARGET_COUNT = 2
+        ram = env.raw_env.ram
+        
+        # Clamp reserve so we don't play forever? 
+        # Let's try keeping reserve high (so they keep spawning) but only allow 2 slots.
+        # If we teleport slots 3 & 4 to 0,0, they might get "stuck" occupying the slot?
+        # Let's test.
+        
+        for i in range(TARGET_COUNT + 1, 7): # Slots 3 to 6
+             if 0x90 + i < 0x100:
+                 env.raw_env.ram[0x90 + i] = 0 # X
+                 env.raw_env.ram[0x98 + i] = 0 # Y
+                 # Also maybe stun them?
+                 
+        # -------------------------------------------
         
         # Input
         keys = pygame.key.get_pressed()
@@ -122,6 +148,14 @@ def main():
         screen.blit(font_ui.render("RAM INSPECTOR:", True, (255, 255, 0)), (x_start, y_pos))
         y_pos += 25
         
+        # DEBUG: Enemies Control
+        enemies_left = ram[0x80]
+        enemies_on_screen = ram[0xA0]
+        screen.blit(font_mono.render(f"ENEMIES LEFT (0x80): {enemies_left}", True, (255, 100, 255)), (x_start, y_pos))
+        y_pos += 20
+        screen.blit(font_mono.render(f"ON SCREEN (0xA0):    {enemies_on_screen}", True, (255, 100, 255)), (x_start, y_pos))
+        y_pos += 20
+
         # 1. Player
         px, py = ram[0x90], ram[0x98]
         p_dir = ram[0x99] # Direction
