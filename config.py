@@ -35,16 +35,16 @@ REWARD_VARIANTS = {
     "DEFAULT": {
         # Balanced: Map control (0.03 * 400 cells = 12 pts) is roughly equal to ~12 Kills.
         # Encourages moving out of base.
-        "kill": 1.0, "death": -1.0, "base": -1.0, "explore": 0.01, "win": 20.0
+        "kill": 1.0, "death": -1.0, "base": -1.0, "explore": 0.01, "win": 20.0, "time": -0.005
     },
     "EXPLORER": {
-        "kill": 0.1, "death": -0.5, "base": -5.0, "explore": 0.05, "win": 10.0 # Focus on map coverage
+        "kill": 0.1, "death": -0.5, "base": -5.0, "explore": 0.05, "win": 10.0, "time": -0.005 # Focus on map coverage
     },
     "SURVIVOR": {
-        "kill": 1.0, "death": -5.0, "base": -30.0, "explore": 0.0, "win": 50.0 # Do not die!
+        "kill": 1.0, "death": -5.0, "base": -30.0, "explore": 0.0, "win": 50.0, "time": 0.0 # No hunger for survivor!
     },
     "AGGRESSIVE": {
-        "kill": 1.0, "death": -1.0, "base": -20.0, "explore": 0.1, "win": 20.0 # Kill everything
+        "kill": 1.0, "death": -1.0, "base": -20.0, "explore": 0.1, "win": 20.0, "time": -0.01 # Double hunger!
     }
 }
 
