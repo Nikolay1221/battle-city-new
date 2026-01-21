@@ -88,6 +88,7 @@ class BattleCityEnv(gym.Env):
             self.rew_explore = reward_config.get('explore', 0.01)
             self.rew_win = reward_config.get('win', 20.0)
             self.rew_time = reward_config.get('time', -0.005) # Default if missing in config
+            self.rew_dist = reward_config.get('distance', 0.01)
         else:
             self.rew_kill = getattr(config, 'REW_KILL', 1.0)
             self.rew_death = getattr(config, 'REW_DEATH', -1.0)
@@ -95,7 +96,8 @@ class BattleCityEnv(gym.Env):
             self.rew_explore = getattr(config, 'REW_EXPLORE', 0.01)
             self.rew_win = getattr(config, 'REW_WIN', 50.0)
             self.rew_time = getattr(config, 'REW_TIME', -0.005)
-        
+            self.rew_dist = getattr(config, 'REW_DISTANCE', 0.01)
+
         # CONDITIONAL WIN REWARD
         # Only grant win reward if this is a "Full" game (20 enemies)
         if self.enemy_count >= 20:
@@ -147,6 +149,11 @@ class BattleCityEnv(gym.Env):
         self.BASE_X = 120
         self.BASE_Y = 216
         self.prev_enemies = [] # Track enemy state for defense logic
+        
+        # Path-Based Reward Cache
+        self.cached_path_length = 999
+        self.path_recalc_counter = 0
+        self.PATH_RECALC_INTERVAL = 5  # Recalculate every 5 steps
 
 
     def _get_tactical_map(self):
@@ -249,6 +256,7 @@ class BattleCityEnv(gym.Env):
         self.prev_score_sum = sum([int(self.raw_env.ram[addr]) for addr in self.ADDR_SCORE])
 
         self.idle_steps = 0
+        self.prev_min_dist = 999.0 # Reset distance tracker
         self.frames.clear()
         return self._get_obs(), {}
 
@@ -371,10 +379,24 @@ class BattleCityEnv(gym.Env):
         
         # 1. TIME PENALTY (HUNGER)
         # Force agent to solve the level quickly. 1000 steps = -5.0 score.
-        # Only apply if it's a full combat game and enemies are still alive
         if self.enemy_count >= 20 and not self.level_cleared:
              reward += self.rew_time
-             
+        
+        # 2. PATH-BASED REWARD (Smart Magnet)
+        # Instead of Euclidean distance, use BFS path length
+        self.path_recalc_counter += 1
+        
+        if self.path_recalc_counter >= self.PATH_RECALC_INTERVAL:
+            self.path_recalc_counter = 0
+            # Find nearest enemy and calculate path length
+            new_path_length = self._get_path_length_to_nearest_enemy(p_x, p_y, current_enemies)
+            
+            if new_path_length < self.cached_path_length and new_path_length < 200:
+                reward += self.rew_dist  # Moved closer along path!
+                info['reward_events'].append(f"PATH (+{self.rew_dist})")
+            
+            self.cached_path_length = new_path_length
+
         # Condition 1: Kills Limit (Only if full game)
         # If enemy_count < 20, we don't grant win for killing all (because there aren't 20)
         # unless we explicitly want to logic that out. 
@@ -512,6 +534,19 @@ class BattleCityEnv(gym.Env):
         self.episode_score += reward
         info['score'] = self.episode_score
         
+        # --- ENEMY DETECTION FOR VISUALIZATION ---
+        player_cv, enemies_data = self._detect_enemies()
+        info['player_cv'] = player_cv
+        info['enemy_positions'] = enemies_data
+        info['enemies_detected'] = len(enemies_data)
+        
+        if enemies_data:
+            p_x, p_y = int(ram[0x90]), int(ram[0x98])
+            dists = [np.sqrt((ex - p_x)**2 + (ey - p_y)**2) for (ex, ey, *_) in enemies_data]
+            info['closest_enemy_dist'] = min(dists)
+        else:
+            info['closest_enemy_dist'] = 999.0
+        
         return self._get_obs(), reward, terminated, truncated, info
 
     def render(self, mode='human'):
@@ -532,3 +567,114 @@ class BattleCityEnv(gym.Env):
             
     def close(self):
         self.env.close()
+
+    # --- ENEMY DETECTION HELPER ---
+    def _detect_enemies(self):
+        """
+        Detects enemies using RAM (100% Accurate).
+        RAM Map:
+        X Coords: 0x90 (Player), 0x91-0x94 (Enemies)
+        Y Coords: 0x98 (Player), 0x99-0x9C (Enemies)
+        """
+        ram = self.raw_env.ram
+        screen = self.raw_env.screen
+        
+        # 1. Player (Slot 0)
+        px = int(ram[0x90])
+        py = int(ram[0x98])
+        player_pos = (px + 8, py + 8)  # Center of tank
+        
+        # 2. Enemies (Slots 1-4)
+        enemies = []
+        
+        for i in range(1, 6):  # 5 slots (Battle City can use slot 5 sometimes)
+            ex = int(ram[0x90 + i])
+            ey = int(ram[0x98 + i])
+            
+            # Skip empty slots (coords at 0,0)
+            if ex == 0 and ey == 0:
+                continue
+            
+            # --- LoS Check (Raycast) ---
+            is_visible = False
+            
+            # GAME MECHANIC: Axis Alignment (Tanks shoot straight)
+            dx = abs(ex - px)
+            dy = abs(ey - py)
+            is_aligned = (dx < 12) or (dy < 12)
+            
+            if is_aligned:
+                is_visible = True
+                # DENSER SAMPLING (10 points)
+                for t in np.linspace(0.1, 0.9, 10):
+                    sx = int(px + (ex - px) * t)
+                    sy = int(py + (ey - py) * t)
+                    if 0 <= sx < 256 and 0 <= sy < 240:
+                        pixel = screen[sy, sx]
+                        if pixel[0] > 60:  # Wall (Red channel high)
+                            is_visible = False
+                            break
+            
+            # Format: (x_center, y_center, slot_id, confidence, is_visible)
+            enemies.append((ex + 8, ey + 8, i, 1.0, is_visible))
+            
+        return player_pos, enemies
+
+    def _get_path_length_to_nearest_enemy(self, p_x, p_y, enemies):
+        """
+        Calculate BFS path length from player to nearest enemy.
+        Returns path length (in grid cells) or 999 if no path found.
+        """
+        if not enemies:
+            return 999
+        
+        try:
+            grid_map = self._get_tactical_map()
+        except:
+            return 999
+        
+        # Find nearest enemy by Euclidean (to pick target)
+        min_dist = 999.0
+        target_x, target_y = 0, 0
+        
+        for e in enemies:
+            if e['hp'] > 0 or (e['x'] != 0 or e['y'] != 0):
+                d = np.sqrt((e['x'] - p_x)**2 + (e['y'] - p_y)**2)
+                if d < min_dist:
+                    min_dist = d
+                    target_x, target_y = e['x'], e['y']
+        
+        if target_x == 0 and target_y == 0:
+            return 999
+        
+        # Convert to grid coords (52x52 over 208x208 play area)
+        # Map area: 16:224 pixels. Grid: 52 cells -> 4px per cell.
+        gx_start = max(0, min(51, int((p_x - 16) / 4)))
+        gy_start = max(0, min(51, int((p_y - 16) / 4)))
+        gx_end   = max(0, min(51, int((target_x - 16) / 4)))
+        gy_end   = max(0, min(51, int((target_y - 16) / 4)))
+        
+        # Quick BFS
+        queue = [(gx_start, gy_start, 0)]  # x, y, distance
+        visited = set([(gx_start, gy_start)])
+        
+        while queue:
+            cx, cy, dist = queue.pop(0)
+            
+            if cx == gx_end and cy == gy_end:
+                return dist
+            
+            if dist > 100:  # Limit search depth
+                continue
+            
+            for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < 52 and 0 <= ny < 52:
+                    if (nx, ny) not in visited:
+                        val = grid_map[ny, nx]
+                        # Passable: 0 (empty), 80 (enemy), 150 (player)
+                        if val == 0 or val == 80 or val == 150:
+                            visited.add((nx, ny))
+                            queue.append((nx, ny, dist + 1))
+        
+        return 999  # No path found

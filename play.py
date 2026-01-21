@@ -59,6 +59,11 @@ def main():
     
     clock = pygame.time.Clock()
     running = True
+    
+    # Path caching
+    cached_path = []
+    path_recalc_counter = 0
+    PATH_RECALC_INTERVAL = 10  # Recalculate every 10 frames
 
     msg_log = deque(maxlen=50) # Increased history
     popups = [] # List of [text, timer, color]
@@ -96,7 +101,8 @@ def main():
         if keys[pygame.K_TAB]:    raw_action |= 0x04
         
         if raw_action > 0:
-            obs, reward, terminated, truncated, info = env.raw_env.step(raw_action)
+            obs, reward, done, info = env.raw_env.step(raw_action)
+            terminated, truncated = done, False
         else:
             up, down = keys[pygame.K_UP], keys[pygame.K_DOWN]
             left, right = keys[pygame.K_LEFT], keys[pygame.K_RIGHT]
@@ -128,6 +134,42 @@ def main():
         surf = pygame.surfarray.make_surface(frame.swapaxes(0,1))
         surf = pygame.transform.scale(surf, (w * SCALE, h * SCALE))
         screen.blit(surf, (0, 0))
+        
+        # --- DRAW BOUNDING BOXES (DEBUG) ---
+        ram = env.raw_env.ram
+        
+        # Draw Player (from info or RAM)
+        if 'player_cv' in info:
+            px_c, py_c = info['player_cv']
+            px, py = px_c - 8, py_c - 8  # Center to top-left
+        else:
+            px, py = ram[0x90], ram[0x98]
+        
+        pygame.draw.rect(screen, (0, 0, 255), (px*SCALE, py*SCALE, 16*SCALE, 16*SCALE), 2) # Blue Box
+        lbl_player = font_mono.render("PLAYER", True, (0, 255, 255))
+        screen.blit(lbl_player, (px*SCALE, py*SCALE - 15))
+        
+        # Draw Enemies (from info with LoS)
+        if 'enemy_positions' in info:
+            for enemy_data in info['enemy_positions']:
+                ex, ey, slot_id, score, is_visible = enemy_data
+                ex_s, ey_s = ex - 8, ey - 8  # Center to top-left
+                
+                # Draw Box (Red)
+                pygame.draw.rect(screen, (255, 0, 0), (ex_s*SCALE, ey_s*SCALE, 16*SCALE, 16*SCALE), 2)
+                
+                # Draw Label
+                status = "LoS" if is_visible else "X"
+                lbl = font_mono.render(f"#{slot_id} {status}", True, (255, 255, 0))
+                screen.blit(lbl, (ex_s*SCALE, ey_s*SCALE - 15))
+        else:
+            # Fallback: Direct RAM
+            for i in range(1, 5):
+                if ram[0x60 + i] > 0:
+                    ex, ey = ram[0x90 + i], ram[0x98 + i]
+                    pygame.draw.rect(screen, (255, 0, 0), (ex*SCALE, ey*SCALE, 16*SCALE, 16*SCALE), 2)
+                    lbl = font_mono.render(f"#{i}", True, (255, 255, 0))
+                    screen.blit(lbl, (ex*SCALE, ey*SCALE - 15))
         
         # Render Side Panel Background
         pygame.draw.rect(screen, (30, 30, 30), (w*SCALE, 0, SIDE_PANEL, h*SCALE))
@@ -247,7 +289,7 @@ def main():
         y_pos += 20
         
         active_enemies = 0
-        for i in range(1, 7):
+        for i in range(1, 5): # MAX 4 ENEMIES ON SCREEN
             hp = ram[0x60 + i]
             ex, ey = ram[0x90 + i], ram[0x98 + i]
             
@@ -263,6 +305,114 @@ def main():
             y_pos += 18
             
         y_pos += 10
+        
+        # 4. Magnet (Distance) Debug & PATHFINDING
+        # Calculate min distance exactly as in env
+        import numpy as np
+        min_dist = 999.0
+        nearest_idx = -1
+        target_ex, target_ey = 0, 0
+        
+        dist_debug_lines = []
+        for i in range(1, 6):  # 5 slots
+            ex, ey = float(ram[0x90 + i]), float(ram[0x98 + i])
+            
+            # Skip empty slots (coords at 0,0)
+            if ex == 0 and ey == 0:
+                dist_debug_lines.append(f"#{i}: ---")
+                continue
+            
+            px_f, py_f = float(px), float(py)
+            d = np.sqrt((ex - px_f)**2 + (ey - py_f)**2)
+            
+            dist_debug_lines.append(f"#{i}: {d:.1f}")
+            
+            if d < min_dist:
+                min_dist = d
+                nearest_idx = i
+                target_ex, target_ey = ex, ey
+        
+        if nearest_idx != -1:
+             # Get explicit values for display
+             t_ex, t_ey = float(ram[0x90 + nearest_idx]), float(ram[0x98 + nearest_idx])
+             mag_txt = f"MAGNET: {min_dist:.1f} | P({px},{py})->E#{nearest_idx}({int(t_ex)},{int(t_ey)})"
+             mag_col = (100, 255, 255) # Cyan
+             
+             # --- PATHFINDING VISUALIZATION (BFS) ---
+             # Only recalculate every N frames for performance
+             path_recalc_counter += 1
+             
+             if path_recalc_counter >= PATH_RECALC_INTERVAL:
+                 path_recalc_counter = 0
+                 
+                 # 1. Get Grid (52x52)
+                 try:
+                     grid_map = env._get_tactical_map() # 0=Empty, >0=Obstacle
+                 
+                     # 2. Convert Coords to Grid (52x52 over 208x208 play area)
+                     gx_start = int((px - 8) / 4)
+                     gy_start = int((py - 8) / 4)
+                     gx_end   = int((target_ex - 8) / 4)
+                     gy_end   = int((target_ey - 8) / 4)
+                     
+                     # Clip
+                     gx_start = max(0, min(51, gx_start))
+                     gy_start = max(0, min(51, gy_start))
+                     gx_end   = max(0, min(51, gx_end))
+                     gy_end   = max(0, min(51, gy_end))
+                     
+                     # 3. Quick BFS
+                     queue = [(gx_start, gy_start, [])]
+                     visited = set([(gx_start, gy_start)])
+                     path_found = []
+                     
+                     while queue:
+                         cx, cy, path = queue.pop(0)
+                         if cx == gx_end and cy == gy_end:
+                             path_found = path + [(cx, cy)]
+                             break
+                         
+                         if len(path) > 100: continue
+                         
+                         for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
+                             nx, ny = cx+dx, cy+dy
+                             if 0 <= nx < 52 and 0 <= ny < 52:
+                                 if (nx, ny) not in visited:
+                                     val = grid_map[ny, nx]
+                                     if val == 0 or val == 80 or val == 150:
+                                         visited.add((nx, ny))
+                                         queue.append((nx, ny, path + [(cx, cy)]))
+                     
+                     # 4. Save to cache
+                     if path_found:
+                         cached_path = path_found
+                         
+                 except Exception as e:
+                     print(f"Pathfinding Error: {e}")
+             
+             # Draw cached path (always, even between recalcs)
+             if cached_path:
+                 points = []
+                 for (gx, gy) in cached_path:
+                     screen_x = (16 + gx * 4 + 2) * SCALE
+                     screen_y = (16 + gy * 4 + 2) * SCALE
+                     points.append((screen_x, screen_y))
+                 
+                 if len(points) > 1:
+                     pygame.draw.lines(screen, (0, 255, 0), False, points, 2)
+
+        else:
+             mag_txt = "MAGNET: NO TARGET"
+             mag_col = (100, 100, 100)
+             
+        # Show all distances
+        for dbg_line in dist_debug_lines:
+            screen.blit(font_mono.render(dbg_line, True, (150, 150, 150)), (x_start, y_pos))
+            y_pos += 15
+        y_pos += 5
+             
+        screen.blit(font_mono.render(mag_txt, True, mag_col), (x_start, y_pos))
+        y_pos += 25 # Fix overlap
         
         # --- STATS ---
         lives = ram[0x51]
