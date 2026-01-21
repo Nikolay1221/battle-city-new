@@ -7,7 +7,7 @@ NUM_CPU = 8  # Используем все ядра для сбора опыта
 # --- HYBRID CONFIGURATION ---
 NUM_VIRTUAL = 2
 
-HEADLESS_MODE = False
+HEADLESS_MODE = True
 
 # --- TRAINING DURATION ---
 TOTAL_TIMESTEPS = 6_000_000
@@ -27,6 +27,7 @@ REW_DEATH = -1.0
 REW_BASE = -20.0
 REW_EXPLORE = 0.01
 REW_WIN = 20.0
+REW_TIME = -0.005 # Штраф за каждый шаг (Голод), чтобы не стоял на месте
 
 # --- REWARD PROFILES ---
 # Allows different environments to incentivize different behaviors
@@ -34,7 +35,7 @@ REWARD_VARIANTS = {
     "DEFAULT": {
         # Balanced: Map control (0.03 * 400 cells = 12 pts) is roughly equal to ~12 Kills.
         # Encourages moving out of base.
-        "kill": 1.0, "death": -1.0, "base": -20.0, "explore": 0.01, "win": 20.0
+        "kill": 1.0, "death": -1.0, "base": -1.0, "explore": 0.01, "win": 20.0
     },
     "EXPLORER": {
         "kill": 0.1, "death": -0.5, "base": -5.0, "explore": 0.05, "win": 10.0 # Focus on map coverage
@@ -97,7 +98,7 @@ BATCH_SIZE    = 1024
 # Если вылетит ошибка, ставь 128, но 256 лучше.
 
 N_EPOCHS = 2  # Учимся усердно на каждом куске данных.
-ENT_COEF = 0.01  # Для старта с нуля оставляем 0.05!
+ENT_COEF = 0.05  # Увеличили в 5 раз (0.01 -> 0.05), чтобы он НЕ успокаивался на 3 фрагах, а искал способ убить всех 20.
 # Ему нужно много экспериментировать в начале.
 GAMMA = 0.99
 CLIP_RANGE = 0.2  # Даем свободу изменений.

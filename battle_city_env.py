@@ -87,12 +87,14 @@ class BattleCityEnv(gym.Env):
             self.rew_base = reward_config.get('base', -20.0)
             self.rew_explore = reward_config.get('explore', 0.01)
             self.rew_win = reward_config.get('win', 20.0)
+            self.rew_time = reward_config.get('time', -0.005) # Default if missing in config
         else:
             self.rew_kill = getattr(config, 'REW_KILL', 1.0)
             self.rew_death = getattr(config, 'REW_DEATH', -1.0)
             self.rew_base = getattr(config, 'REW_BASE', -20.0)
             self.rew_explore = getattr(config, 'REW_EXPLORE', 0.01)
             self.rew_win = getattr(config, 'REW_WIN', 50.0)
+            self.rew_time = getattr(config, 'REW_TIME', -0.005)
         
         # CONDITIONAL WIN REWARD
         # Only grant win reward if this is a "Full" game (20 enemies)
@@ -367,6 +369,12 @@ class BattleCityEnv(gym.Env):
         # ...
         curr_stage = int(ram[self.ADDR_STAGE])
         
+        # 1. TIME PENALTY (HUNGER)
+        # Force agent to solve the level quickly. 1000 steps = -5.0 score.
+        # Only apply if it's a full combat game and enemies are still alive
+        if self.enemy_count >= 20 and not self.level_cleared:
+             reward += self.rew_time
+             
         # Condition 1: Kills Limit (Only if full game)
         # If enemy_count < 20, we don't grant win for killing all (because there aren't 20)
         # unless we explicitly want to logic that out. 
