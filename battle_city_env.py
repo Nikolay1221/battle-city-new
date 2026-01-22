@@ -40,8 +40,10 @@ class BattleCityEnv(gym.Env):
         self.action_space = spaces.Discrete(len(self.actions_list))
 
         # Tactical Grid Settings (High Res: 52x52)
+        # Tactical Grid Settings (High Res: 52x52)
         self.GRID_SIZE = 52 
-        self.observation_space = spaces.Box(low=0, high=255, shape=(self.GRID_SIZE, self.GRID_SIZE, self.STACK_SIZE), dtype=np.uint8)
+        self.OBS_SIZE = 64
+        self.observation_space = spaces.Box(low=0, high=255, shape=(self.OBS_SIZE, self.OBS_SIZE, self.STACK_SIZE), dtype=np.uint8)
         
         # Color definitions (RGB) for visual scanning
         self.TILE_COLORS = {
@@ -157,8 +159,17 @@ class BattleCityEnv(gym.Env):
         while len(self.frames) < self.STACK_SIZE:
             self.frames.append(current_map)
         self.frames.append(current_map)
-        obs_stack = np.stack(self.frames, axis=-1)
-        return obs_stack
+        
+        # Stack frames
+        obs = np.stack(self.frames, axis=-1)
+        
+        # Resize to 64x64 if needed
+        if obs.shape[0] != self.OBS_SIZE:
+             obs = cv2.resize(obs, (self.OBS_SIZE, self.OBS_SIZE), interpolation=cv2.INTER_NEAREST)
+             if len(obs.shape) == 2:
+                 obs = obs[..., np.newaxis]
+                 
+        return obs
 
     def get_tactical_rgb(self):
         if not self.frames: return np.zeros((52, 52, 3), dtype=np.uint8)
